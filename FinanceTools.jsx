@@ -10,6 +10,8 @@ import {
   PieChart,
   Pie,
   Legend,
+  AreaChart,
+  Area,
 } from "recharts";
 
 // ─── Safe Math Utilities ───────────────────────────────────────────────────────
@@ -806,6 +808,1452 @@ function SafeNoteCalculator({ currency }) {
   );
 }
 
+// ─── Shared Chart Colors ──────────────────────────────────────────────────────
+
+const CHART_COLORS = [
+  "#3b82f6", "#6366f1", "#8b5cf6", "#a855f7", "#ec4899",
+  "#0ea5e9", "#06b6d4", "#14b8a6", "#22c55e", "#84cc16",
+  "#f59e0b", "#ef4444", "#64748b", "#f97316", "#10b981",
+  "#e879f9", "#2dd4bf", "#fb923c", "#a3e635", "#38bdf8",
+];
+
+// ─── Calculator 2 — Post-Money Dilution Calculator ───────────────────────────
+
+const DILUTION_DEFAULTS = {
+  preMoney: "",
+  investment: "",
+  totalShares: "",
+  optionPoolMode: "number",
+  optionPoolValue: "",
+  shareholders: [
+    { id: 1, name: "Founder 1", shares: "" },
+    { id: 2, name: "Founder 2", shares: "" },
+    { id: 3, name: "Option Pool (existing)", shares: "" },
+  ],
+};
+
+function DilutionCalculator({ currency }) {
+  const [inputs, setInputs] = useState(DILUTION_DEFAULTS);
+  const [copyFn, CopyModalNode] = useCopyToClipboard();
+
+  const setField = useCallback(
+    (field) => (val) => setInputs((prev) => ({ ...prev, [field]: val })),
+    []
+  );
+
+  const addShareholder = useCallback(() => {
+    setInputs((prev) => {
+      if (prev.shareholders.length >= 20) return prev;
+      return {
+        ...prev,
+        shareholders: [
+          ...prev.shareholders,
+          { id: Date.now(), name: "", shares: "" },
+        ],
+      };
+    });
+  }, []);
+
+  const removeShareholder = useCallback((id) => {
+    setInputs((prev) => ({
+      ...prev,
+      shareholders: prev.shareholders.filter((s) => s.id !== id),
+    }));
+  }, []);
+
+  const updateShareholder = useCallback((id, field, val) => {
+    setInputs((prev) => ({
+      ...prev,
+      shareholders: prev.shareholders.map((s) =>
+        s.id === id ? { ...s, [field]: val } : s
+      ),
+    }));
+  }, []);
+
+  const results = useMemo(() => {
+    try {
+      const preMoney = parseVal(inputs.preMoney);
+      const investment = parseVal(inputs.investment);
+      const totalShares = parseVal(inputs.totalShares);
+      const poolValRaw = parseVal(inputs.optionPoolValue);
+
+      const postMoney =
+        isFiniteNum(preMoney) && isFiniteNum(investment)
+          ? preMoney + investment
+          : null;
+
+      const pps =
+        isFiniteNum(preMoney) && isFiniteNum(totalShares) && totalShares > 0
+          ? preMoney / totalShares
+          : null;
+
+      const newInvestorShares =
+        isFiniteNum(investment) && isFiniteNum(pps) && pps > 0
+          ? investment / pps
+          : null;
+
+      // Option pool: number mode = direct value;
+      // percent mode = algebraically solved: shares = p% × (existing + investor) / (1 − p%)
+      let newOptionShares = null;
+      if (inputs.optionPoolMode === "number") {
+        newOptionShares = isFiniteNum(poolValRaw) && poolValRaw > 0 ? poolValRaw : null;
+      } else if (inputs.optionPoolMode === "percent" && isFiniteNum(poolValRaw)) {
+        const poolPct = clamp(poolValRaw, 0, 100) / 100;
+        if (isFiniteNum(totalShares) && poolPct > 0 && poolPct < 1) {
+          const investorBase = isFiniteNum(newInvestorShares) ? newInvestorShares : 0;
+          newOptionShares = (poolPct * (totalShares + investorBase)) / (1 - poolPct);
+        }
+      }
+
+      let totalPostRound = isFiniteNum(totalShares) ? totalShares : null;
+      if (isFiniteNum(totalPostRound)) {
+        if (isFiniteNum(newInvestorShares)) totalPostRound += newInvestorShares;
+        if (isFiniteNum(newOptionShares)) totalPostRound += newOptionShares;
+      }
+
+      const shTableSum = inputs.shareholders.reduce((sum, s) => {
+        const v = parseVal(s.shares);
+        return sum + (isFiniteNum(v) && v > 0 ? v : 0);
+      }, 0);
+
+      const sharesMatch =
+        !isFiniteNum(totalShares) || Math.abs(shTableSum - totalShares) < 0.5;
+
+      // Effective pre-round total for ownership % base
+      const effectivePreTotal = isFiniteNum(totalShares)
+        ? totalShares
+        : shTableSum > 0
+        ? shTableSum
+        : null;
+
+      const shareholders = inputs.shareholders.map((s) => {
+        const shares = parseVal(s.shares);
+        const hasShares = isFiniteNum(shares) && shares > 0;
+        const preOwnership =
+          hasShares && isFiniteNum(effectivePreTotal) && effectivePreTotal > 0
+            ? (shares / effectivePreTotal) * 100
+            : null;
+        const postOwnership =
+          hasShares && isFiniteNum(totalPostRound) && totalPostRound > 0
+            ? (shares / totalPostRound) * 100
+            : null;
+        const dilution =
+          isFiniteNum(preOwnership) && isFiniteNum(postOwnership)
+            ? preOwnership - postOwnership
+            : null;
+        return { ...s, sharesNum: shares, hasShares, preOwnership, postOwnership, dilution };
+      });
+
+      const newInvestorOwnership =
+        isFiniteNum(newInvestorShares) &&
+        isFiniteNum(totalPostRound) &&
+        totalPostRound > 0
+          ? (newInvestorShares / totalPostRound) * 100
+          : null;
+
+      const newOptionOwnership =
+        isFiniteNum(newOptionShares) &&
+        isFiniteNum(totalPostRound) &&
+        totalPostRound > 0
+          ? (newOptionShares / totalPostRound) * 100
+          : null;
+
+      // Build chart entities list (existing shareholders + new pool + new investor)
+      const activeShareholders = shareholders.filter((s) => s.hasShares);
+      const allEntities = [
+        ...activeShareholders,
+        ...(isFiniteNum(newOptionShares)
+          ? [
+              {
+                id: "__newpool__",
+                name: "New Option Pool",
+                sharesNum: newOptionShares,
+                preOwnership: 0,
+                postOwnership: newOptionOwnership,
+                dilution: null,
+                hasShares: true,
+              },
+            ]
+          : []),
+        ...(isFiniteNum(newInvestorShares)
+          ? [
+              {
+                id: "__investor__",
+                name: "New Investor",
+                sharesNum: newInvestorShares,
+                preOwnership: 0,
+                postOwnership: newInvestorOwnership,
+                dilution: null,
+                hasShares: true,
+              },
+            ]
+          : []),
+      ];
+
+      // Build stacked horizontal bar chart data
+      const barChartData =
+        allEntities.length > 0
+          ? (() => {
+              const beforeRow = { label: "Before Round" };
+              const afterRow = { label: "After Round" };
+              allEntities.forEach((e) => {
+                beforeRow[e.name] = isFiniteNum(e.preOwnership)
+                  ? parseFloat(e.preOwnership.toFixed(2))
+                  : 0;
+                afterRow[e.name] = isFiniteNum(e.postOwnership)
+                  ? parseFloat(e.postOwnership.toFixed(2))
+                  : 0;
+              });
+              return [beforeRow, afterRow];
+            })()
+          : null;
+
+      return {
+        preMoney,
+        investment,
+        totalShares,
+        postMoney,
+        pps,
+        newInvestorShares,
+        newOptionShares,
+        totalPostRound,
+        shareholders,
+        newInvestorOwnership,
+        newOptionOwnership,
+        sharesMatch,
+        shTableSum,
+        barChartData,
+        allEntities,
+      };
+    } catch {
+      return {};
+    }
+  }, [inputs]);
+
+  const handleReset = useCallback(() => setInputs(DILUTION_DEFAULTS), []);
+
+  const handleCopy = useCallback(() => {
+    const r = results;
+    const text = [
+      "Post-Money Dilution Calculator",
+      "================================",
+      `Pre-Money Valuation:     ${fmtCurrency(r.preMoney, currency)}`,
+      `Investment Amount:       ${fmtCurrency(r.investment, currency)}`,
+      `Post-Money Valuation:    ${fmtCurrency(r.postMoney, currency)}`,
+      `Price Per Share:         ${fmtCurrency(r.pps, currency, 2)}`,
+      `New Investor Shares:     ${fmtNum(r.newInvestorShares)}`,
+      `New Option Pool Shares:  ${fmtNum(r.newOptionShares)}`,
+      `Total Shares Post-Round: ${fmtNum(r.totalPostRound)}`,
+      `New Investor Ownership:  ${fmtPct(r.newInvestorOwnership)}`,
+      "",
+      "Ownership Table:",
+      ...(r.shareholders || [])
+        .filter((s) => s.hasShares)
+        .map(
+          (s) =>
+            `  ${s.name || "?"}: Before=${fmtPct(s.preOwnership, 1)} → After=${fmtPct(
+              s.postOwnership,
+              1
+            )} (Dilution: ${
+              isFiniteNum(s.dilution) && s.dilution > 0.005
+                ? `-${fmtPct(s.dilution, 1)}`
+                : "—"
+            })`
+        ),
+    ].join("\n");
+    copyFn(text);
+  }, [results, currency, copyFn]);
+
+  const r = results;
+  const currSymbol = CURRENCY_META[currency]?.symbol || "$";
+
+  return (
+    <>
+      {CopyModalNode}
+      <CalcCard
+        title="Post-Money Dilution Calculator"
+        description="See exactly how a new funding round changes ownership percentages across all shareholders. Know your dilution before you negotiate."
+        onReset={handleReset}
+        onCopy={handleCopy}
+      >
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+          {/* ── Inputs ── */}
+          <div>
+            <SectionHeader>Round Parameters</SectionHeader>
+
+            <InputField
+              label="Pre-Money Valuation"
+              value={inputs.preMoney}
+              onChange={setField("preMoney")}
+              placeholder="e.g. 8000000"
+              prefix={currSymbol}
+            />
+            <InputField
+              label="Investment Amount"
+              value={inputs.investment}
+              onChange={setField("investment")}
+              placeholder="e.g. 2000000"
+              prefix={currSymbol}
+            />
+            <InputField
+              label="Current Total Shares Outstanding"
+              value={inputs.totalShares}
+              onChange={setField("totalShares")}
+              placeholder="e.g. 10000000"
+            />
+
+            {/* Option pool with mode toggle */}
+            <div className="mb-3">
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-xs font-medium text-slate-400">
+                  Option Pool — New Shares This Round
+                </label>
+                <div className="flex bg-slate-800/60 rounded-lg p-0.5 border border-slate-700/40">
+                  {[
+                    ["number", "#"],
+                    ["percent", "%"],
+                  ].map(([mode, lbl]) => (
+                    <button
+                      key={mode}
+                      onClick={() => setField("optionPoolMode")(mode)}
+                      className={[
+                        "text-xs px-2.5 py-1 rounded-md font-semibold transition-colors",
+                        inputs.optionPoolMode === mode
+                          ? "bg-cyan-600 text-white"
+                          : "text-slate-400 hover:text-slate-200",
+                      ].join(" ")}
+                    >
+                      {lbl}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="relative flex items-center">
+                <input
+                  type="number"
+                  value={inputs.optionPoolValue}
+                  onChange={(e) => setField("optionPoolValue")(e.target.value)}
+                  placeholder={
+                    inputs.optionPoolMode === "percent" ? "e.g. 10" : "e.g. 1000000"
+                  }
+                  className="w-full bg-slate-800/80 border border-slate-600/70 rounded-lg px-3 py-2 pr-16 text-white text-sm placeholder-slate-600 focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/50 transition-colors appearance-none"
+                />
+                <span className="absolute right-3 text-slate-500 text-xs pointer-events-none">
+                  {inputs.optionPoolMode === "percent" ? "% post" : "shares"}
+                </span>
+              </div>
+              {inputs.optionPoolMode === "percent" && (
+                <p className="text-xs text-slate-500 mt-1 italic">
+                  Solved algebraically: shares = p% × (existing + investor) ÷ (1 − p%)
+                </p>
+              )}
+            </div>
+
+            {/* Shareholder table */}
+            <div className="mt-5">
+              <div className="flex items-center justify-between mb-2">
+                <SectionHeader>Shareholder Table</SectionHeader>
+                <span className="text-xs text-slate-600 pb-3">
+                  {inputs.shareholders.length}/20
+                </span>
+              </div>
+
+              {!r.sharesMatch && isFiniteNum(r.totalShares) && (
+                <InfoBanner variant="yellow">
+                  Shareholder shares ({fmtNum(r.shTableSum)}) don&apos;t match total shares
+                  outstanding ({fmtNum(r.totalShares)}). Ownership percentages use your total
+                  shares input.
+                </InfoBanner>
+              )}
+
+              <div className="space-y-1.5">
+                {inputs.shareholders.map((s, idx) => (
+                  <div key={s.id} className="flex gap-1.5 items-center">
+                    <input
+                      type="text"
+                      value={s.name}
+                      onChange={(e) => updateShareholder(s.id, "name", e.target.value)}
+                      placeholder={`Shareholder ${idx + 1}`}
+                      className="flex-1 min-w-0 bg-slate-800/80 border border-slate-600/70 rounded-lg px-2.5 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors"
+                    />
+                    <input
+                      type="number"
+                      value={s.shares}
+                      onChange={(e) => updateShareholder(s.id, "shares", e.target.value)}
+                      placeholder="shares"
+                      className="w-28 bg-slate-800/80 border border-slate-600/70 rounded-lg px-2 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors appearance-none"
+                    />
+                    <button
+                      onClick={() => removeShareholder(s.id)}
+                      className="text-slate-600 hover:text-red-400 transition-colors w-5 shrink-0 text-lg leading-none text-center"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              {inputs.shareholders.length < 20 && (
+                <button
+                  onClick={addShareholder}
+                  className="mt-3 text-xs text-cyan-400 hover:text-cyan-300 border border-cyan-600/30 hover:border-cyan-500/50 px-3 py-1.5 rounded-lg transition-colors w-full"
+                >
+                  + Add Shareholder
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* ── Results ── */}
+          <div>
+            <SectionHeader>Results</SectionHeader>
+
+            {/* Key metrics */}
+            <div className="bg-slate-800/40 rounded-xl p-4 border border-slate-700/30 mb-4">
+              <ResultRow
+                label="Post-Money Valuation"
+                value={fmtCurrency(r.postMoney, currency)}
+                note={
+                  !isFiniteNum(r.postMoney)
+                    ? "Enter Pre-Money and Investment Amount to calculate."
+                    : undefined
+                }
+              />
+              <ResultRow
+                label="Price Per Share"
+                value={fmtCurrency(r.pps, currency, 2)}
+                note={
+                  !isFiniteNum(r.pps)
+                    ? "Enter Pre-Money and Total Shares to calculate."
+                    : undefined
+                }
+              />
+              <ResultRow
+                label="New Investor Shares Issued"
+                value={fmtNum(r.newInvestorShares)}
+                note={
+                  !isFiniteNum(r.newInvestorShares)
+                    ? "Requires Investment Amount and Price Per Share."
+                    : undefined
+                }
+              />
+              <ResultRow
+                label="New Option Pool Shares"
+                value={fmtNum(r.newOptionShares)}
+                note={
+                  !isFiniteNum(r.newOptionShares)
+                    ? "Enter option pool size above."
+                    : undefined
+                }
+              />
+              <ResultRow
+                label="Total Shares Post-Round"
+                value={fmtNum(r.totalPostRound)}
+                note={
+                  !isFiniteNum(r.totalPostRound)
+                    ? "Enter Total Shares Outstanding to calculate."
+                    : undefined
+                }
+              />
+              <ResultRow
+                label="New Investor Ownership"
+                value={fmtPct(r.newInvestorOwnership)}
+                note={
+                  !isFiniteNum(r.newInvestorOwnership)
+                    ? "Requires Investment Amount and Price Per Share."
+                    : undefined
+                }
+                highlight={isFiniteNum(r.newInvestorOwnership)}
+              />
+            </div>
+
+            {/* Ownership comparison table */}
+            {r.shareholders && r.shareholders.some((s) => s.hasShares) && (
+              <div className="bg-slate-800/40 rounded-xl border border-slate-700/30 overflow-hidden mb-4">
+                <div className="grid grid-cols-4 px-3 py-2 bg-slate-700/30 border-b border-slate-700/30">
+                  <span className="text-xs font-semibold text-slate-400">Shareholder</span>
+                  <span className="text-xs font-semibold text-slate-400 text-right">Before</span>
+                  <span className="text-xs font-semibold text-slate-400 text-right">After</span>
+                  <span className="text-xs font-semibold text-slate-400 text-right">Dilution</span>
+                </div>
+                {r.shareholders
+                  .filter((s) => s.hasShares)
+                  .map((s, idx) => (
+                    <div
+                      key={s.id}
+                      className={`grid grid-cols-4 px-3 py-2 border-b border-slate-700/20 last:border-0 ${
+                        idx % 2 !== 0 ? "bg-slate-800/20" : ""
+                      }`}
+                    >
+                      <span className="text-xs text-slate-300 truncate pr-1">
+                        {s.name || `Shareholder ${idx + 1}`}
+                      </span>
+                      <span className="text-xs text-slate-400 text-right">
+                        {fmtPct(s.preOwnership, 1)}
+                      </span>
+                      <span className="text-xs text-white font-medium text-right">
+                        {fmtPct(s.postOwnership, 1)}
+                      </span>
+                      <span
+                        className={`text-xs text-right font-medium ${
+                          isFiniteNum(s.dilution) && s.dilution > 0.005
+                            ? "text-red-400"
+                            : "text-slate-500"
+                        }`}
+                      >
+                        {isFiniteNum(s.dilution) && s.dilution > 0.005
+                          ? `−${fmtPct(s.dilution, 1)}`
+                          : "—"}
+                      </span>
+                    </div>
+                  ))}
+                {isFiniteNum(r.newOptionShares) && (
+                  <div className="grid grid-cols-4 px-3 py-2 border-b border-slate-700/20 bg-slate-700/10">
+                    <span className="text-xs text-slate-400 italic">New Option Pool</span>
+                    <span className="text-xs text-slate-600 text-right">—</span>
+                    <span className="text-xs text-slate-300 text-right">
+                      {fmtPct(r.newOptionOwnership, 1)}
+                    </span>
+                    <span className="text-xs text-slate-600 text-right italic">new</span>
+                  </div>
+                )}
+                {isFiniteNum(r.newInvestorShares) && (
+                  <div className="grid grid-cols-4 px-3 py-2 bg-cyan-950/20">
+                    <span className="text-xs text-cyan-400 font-medium">New Investor</span>
+                    <span className="text-xs text-slate-600 text-right">—</span>
+                    <span className="text-xs text-cyan-300 font-semibold text-right">
+                      {fmtPct(r.newInvestorOwnership, 1)}
+                    </span>
+                    <span className="text-xs text-slate-600 text-right italic">new</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Stacked horizontal bar chart — Before vs After */}
+            {r.barChartData && r.allEntities && r.allEntities.length > 0 && (
+              <div className="bg-slate-800/30 rounded-xl p-4 border border-slate-700/30">
+                <p className="text-xs font-medium text-slate-500 uppercase tracking-wider mb-3">
+                  Ownership — Before vs After
+                </p>
+                <div className="h-24">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart
+                      layout="vertical"
+                      data={r.barChartData}
+                      margin={{ top: 0, right: 8, left: 0, bottom: 0 }}
+                    >
+                      <XAxis
+                        type="number"
+                        domain={[0, 100]}
+                        tickFormatter={(v) => `${v}%`}
+                        tick={{ fill: "#475569", fontSize: 9 }}
+                        axisLine={false}
+                        tickLine={false}
+                      />
+                      <YAxis
+                        type="category"
+                        dataKey="label"
+                        tick={{ fill: "#94a3b8", fontSize: 10 }}
+                        axisLine={false}
+                        tickLine={false}
+                        width={72}
+                      />
+                      <Tooltip
+                        formatter={(val, name) => [`${Number(val).toFixed(1)}%`, name]}
+                        contentStyle={{
+                          background: "#1e293b",
+                          border: "1px solid #334155",
+                          borderRadius: "8px",
+                          fontSize: "11px",
+                          color: "#cbd5e1",
+                        }}
+                      />
+                      {r.allEntities.map((e, i) => (
+                        <Bar
+                          key={String(e.id)}
+                          dataKey={e.name}
+                          stackId="a"
+                          fill={CHART_COLORS[i % CHART_COLORS.length]}
+                          radius={
+                            i === r.allEntities.length - 1 ? [0, 3, 3, 0] : [0, 0, 0, 0]
+                          }
+                        />
+                      ))}
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+                <div className="flex flex-wrap gap-x-3 gap-y-1.5 mt-2">
+                  {r.allEntities.map((e, i) => (
+                    <div key={String(e.id)} className="flex items-center gap-1.5">
+                      <div
+                        className="w-2.5 h-2.5 rounded-sm shrink-0"
+                        style={{ background: CHART_COLORS[i % CHART_COLORS.length] }}
+                      />
+                      <span className="text-xs text-slate-400 max-w-28 truncate">
+                        {e.name || `Shareholder ${i + 1}`}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </CalcCard>
+    </>
+  );
+}
+
+// ─── Calculator 3 — Cap Table Simulator ──────────────────────────────────────
+
+const CAP_TABLE_DEFAULTS = {
+  founders: [
+    { id: 1, name: "Founder 1", shares: "1000000" },
+    { id: 2, name: "Founder 2", shares: "1000000" },
+  ],
+  initialOptionPool: "500000",
+  rounds: [
+    { id: 1, name: "Seed",     preMoney: "", investment: "", optionPool: "", investorName: "Seed Investors" },
+    { id: 2, name: "Series A", preMoney: "", investment: "", optionPool: "", investorName: "Series A Investors" },
+    { id: 3, name: "Series B", preMoney: "", investment: "", optionPool: "", investorName: "Series B Investors" },
+    { id: 4, name: "Series C", preMoney: "", investment: "", optionPool: "", investorName: "Series C Investors" },
+    { id: 5, name: "Series D", preMoney: "", investment: "", optionPool: "", investorName: "Series D Investors" },
+  ],
+  activeRoundCount: 1,
+};
+
+/** Round all party percentages to 2dp, then correct rounding drift on the largest party. */
+function normalizeOwnership(parties, total) {
+  if (!isFiniteNum(total) || total <= 0 || parties.length === 0) return parties;
+  const rounded = parties.map((p) => ({
+    ...p,
+    pctDisplay: parseFloat(((p.shares / total) * 100).toFixed(2)),
+  }));
+  const sum = rounded.reduce((s, p) => s + p.pctDisplay, 0);
+  const diff = parseFloat((100 - sum).toFixed(2));
+  if (Math.abs(diff) > 0.001) {
+    const maxIdx = rounded.reduce(
+      (mi, p, i) => (p.pctDisplay > rounded[mi].pctDisplay ? i : mi),
+      0
+    );
+    rounded[maxIdx] = {
+      ...rounded[maxIdx],
+      pctDisplay: parseFloat((rounded[maxIdx].pctDisplay + diff).toFixed(2)),
+    };
+  }
+  return rounded;
+}
+
+function CapTableSimulator({ currency }) {
+  const [inputs, setInputs] = useState(CAP_TABLE_DEFAULTS);
+  const [subTab, setSubTab] = useState("setup");
+  const [expandedRounds, setExpandedRounds] = useState(new Set([1]));
+  const [copyFn, CopyModalNode] = useCopyToClipboard();
+
+  const setField = useCallback(
+    (field) => (val) => setInputs((prev) => ({ ...prev, [field]: val })),
+    []
+  );
+
+  // ── Founder helpers ──────────────────────────────────────────────────────
+  const addFounder = useCallback(() => {
+    setInputs((prev) => {
+      if (prev.founders.length >= 10) return prev;
+      return {
+        ...prev,
+        founders: [
+          ...prev.founders,
+          { id: Date.now(), name: `Founder ${prev.founders.length + 1}`, shares: "" },
+        ],
+      };
+    });
+  }, []);
+
+  const removeFounder = useCallback((id) => {
+    setInputs((prev) => ({
+      ...prev,
+      founders: prev.founders.filter((f) => f.id !== id),
+    }));
+  }, []);
+
+  const updateFounder = useCallback((id, field, val) => {
+    setInputs((prev) => ({
+      ...prev,
+      founders: prev.founders.map((f) => (f.id === id ? { ...f, [field]: val } : f)),
+    }));
+  }, []);
+
+  // ── Round helpers ────────────────────────────────────────────────────────
+  const addRound = useCallback(() => {
+    setInputs((prev) => {
+      if (prev.activeRoundCount >= 5) return prev;
+      const next = prev.activeRoundCount + 1;
+      setExpandedRounds((er) => new Set([...er, next]));
+      return { ...prev, activeRoundCount: next };
+    });
+  }, []);
+
+  const updateRound = useCallback((id, field, val) => {
+    setInputs((prev) => ({
+      ...prev,
+      rounds: prev.rounds.map((r) => (r.id === id ? { ...r, [field]: val } : r)),
+    }));
+  }, []);
+
+  const toggleRound = useCallback((id) => {
+    setExpandedRounds((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }, []);
+
+  // ── Simulation ──────────────────────────────────────────────────────────
+  const simResults = useMemo(() => {
+    try {
+      const founders = inputs.founders
+        .map((f) => ({ ...f, sharesNum: parseVal(f.shares) }))
+        .filter((f) => isFiniteNum(f.sharesNum) && f.sharesNum > 0);
+
+      if (founders.length === 0) return { noFounders: true };
+
+      const initPool = parseVal(inputs.initialOptionPool);
+      const poolShares = isFiniteNum(initPool) && initPool > 0 ? initPool : 0;
+
+      // Initial party list (founding)
+      const initialParties = [
+        ...founders.map((f) => ({
+          id: f.id,
+          name: f.name,
+          type: "founder",
+          shares: f.sharesNum,
+        })),
+        { id: "pool", name: "Option Pool", type: "pool", shares: poolShares },
+      ];
+
+      const foundingTotal = initialParties.reduce((s, p) => s + p.shares, 0);
+      const foundingNorm = normalizeOwnership(initialParties, foundingTotal);
+
+      const stages = [
+        {
+          stageKey: "founding",
+          label: "Founding",
+          parties: foundingNorm,
+          total: foundingTotal,
+          pps: null,
+          preMoney: null,
+          investment: null,
+          postMoney: null,
+          newInvestorShares: null,
+          newOptionShares: null,
+          roundId: null,
+        },
+      ];
+
+      const activeRounds = inputs.rounds.slice(0, inputs.activeRoundCount);
+
+      for (const round of activeRounds) {
+        const preMoney = parseVal(round.preMoney);
+        const investment = parseVal(round.investment);
+        const newOptionShares = parseVal(round.optionPool);
+
+        // Skip rounds with zero inputs entirely (no column in results)
+        const hasAny =
+          isFiniteNum(preMoney) ||
+          isFiniteNum(investment) ||
+          (isFiniteNum(newOptionShares) && newOptionShares > 0);
+        if (!hasAny) continue;
+
+        const prevStage = stages[stages.length - 1];
+        const openingShares = prevStage.total;
+
+        const pps =
+          isFiniteNum(preMoney) && openingShares > 0
+            ? preMoney / openingShares
+            : null;
+
+        const newInvestorShares =
+          isFiniteNum(investment) && isFiniteNum(pps) && pps > 0
+            ? investment / pps
+            : null;
+
+        const postMoney =
+          isFiniteNum(preMoney) && isFiniteNum(investment)
+            ? preMoney + investment
+            : null;
+
+        // Clone parties from previous stage
+        let nextParties = prevStage.parties.map((p) => ({ ...p }));
+
+        // Grow option pool
+        if (isFiniteNum(newOptionShares) && newOptionShares > 0) {
+          const poolIdx = nextParties.findIndex((p) => p.type === "pool");
+          if (poolIdx >= 0) {
+            nextParties[poolIdx] = {
+              ...nextParties[poolIdx],
+              shares: nextParties[poolIdx].shares + newOptionShares,
+            };
+          }
+        }
+
+        // Add new investor party
+        if (isFiniteNum(newInvestorShares) && newInvestorShares > 0) {
+          const investorName = round.investorName?.trim() || `Round ${round.id} Investor`;
+          nextParties.push({
+            id: `investor-${round.id}`,
+            name: investorName,
+            type: "investor",
+            shares: newInvestorShares,
+          });
+        }
+
+        const newTotal = nextParties.reduce((s, p) => s + p.shares, 0);
+        const normalizedParties = normalizeOwnership(nextParties, newTotal);
+
+        stages.push({
+          stageKey: `round-${round.id}`,
+          label: round.name || `Round ${round.id}`,
+          parties: normalizedParties,
+          total: newTotal,
+          pps,
+          preMoney,
+          investment,
+          postMoney,
+          newInvestorShares,
+          newOptionShares,
+          roundId: round.id,
+        });
+      }
+
+      // Collect all unique party names in order of appearance
+      const partyOrder = [];
+      stages.forEach((stage) => {
+        stage.parties.forEach((p) => {
+          if (!partyOrder.includes(p.name)) partyOrder.push(p.name);
+        });
+      });
+
+      // Assign colors by party type
+      const founderColors = [
+        "#3b82f6", "#6366f1", "#8b5cf6", "#a855f7", "#ec4899",
+        "#db2777", "#9333ea", "#7c3aed", "#4f46e5", "#2563eb",
+      ];
+      const investorColors = ["#0ea5e9", "#06b6d4", "#14b8a6", "#22c55e", "#84cc16"];
+      const partyColors = {};
+      let founderIdx = 0;
+      let investorIdx = 0;
+
+      partyOrder.forEach((name) => {
+        let type = "other";
+        for (const stage of stages) {
+          const p = stage.parties.find((pp) => pp.name === name);
+          if (p) { type = p.type; break; }
+        }
+        if (type === "founder") {
+          partyColors[name] = founderColors[founderIdx++ % founderColors.length];
+        } else if (type === "pool") {
+          partyColors[name] = "#64748b";
+        } else if (type === "investor") {
+          partyColors[name] = investorColors[investorIdx++ % investorColors.length];
+        } else {
+          partyColors[name] = "#94a3b8";
+        }
+      });
+
+      // Build area chart data — one data point per stage
+      const areaChartData = stages.map((stage) => {
+        const point = { stage: stage.label };
+        partyOrder.forEach((name) => {
+          const p = stage.parties.find((pp) => pp.name === name);
+          point[name] = p ? p.pctDisplay : 0;
+        });
+        return point;
+      });
+
+      return { stages, partyOrder, partyColors, areaChartData, noFounders: false };
+    } catch {
+      return { error: true };
+    }
+  }, [inputs]);
+
+  // Derived PPS & postMoney per round (for Setup tab read-only display)
+  const roundDerived = useMemo(() => {
+    const map = {};
+    (simResults?.stages || []).forEach((stage) => {
+      if (stage.roundId !== null) {
+        map[stage.roundId] = { pps: stage.pps, postMoney: stage.postMoney };
+      }
+    });
+    return map;
+  }, [simResults]);
+
+  const handleReset = useCallback(() => {
+    setInputs(CAP_TABLE_DEFAULTS);
+    setExpandedRounds(new Set([1]));
+    setSubTab("setup");
+  }, []);
+
+  const handleCopy = useCallback(() => {
+    const sr = simResults;
+    if (!sr || sr.noFounders || !sr.stages) return;
+    const { stages, partyOrder } = sr;
+    const header = ["Shareholder", ...stages.map((s) => s.label)].join(" | ");
+    const rows = partyOrder.map((name) => {
+      const cells = stages.map((stage) => {
+        const p = stage.parties.find((pp) => pp.name === name);
+        return p ? fmtPct(p.pctDisplay, 1) : "—";
+      });
+      return [name, ...cells].join(" | ");
+    });
+    const summaryLines = stages
+      .filter((s) => s.roundId)
+      .map(
+        (s) =>
+          `  ${s.label}: Pre=${fmtCurrency(s.preMoney, currency)} | Inv=${fmtCurrency(
+            s.investment,
+            currency
+          )} | Post=${fmtCurrency(s.postMoney, currency)} | PPS=${fmtCurrency(
+            s.pps,
+            currency,
+            2
+          )}`
+      );
+    const text = [
+      "Cap Table Simulator",
+      "====================",
+      header,
+      header.replace(/./g, "-"),
+      ...rows,
+      "",
+      "Round Summary:",
+      ...summaryLines,
+    ].join("\n");
+    copyFn(text);
+  }, [simResults, currency, copyFn]);
+
+  const currSymbol = CURRENCY_META[currency]?.symbol || "$";
+  const sr = simResults || {};
+  const noFounders =
+    sr.noFounders ||
+    inputs.founders.every(
+      (f) => !isFiniteNum(parseVal(f.shares)) || parseVal(f.shares) <= 0
+    );
+
+  return (
+    <>
+      {CopyModalNode}
+      <CalcCard
+        title="Cap Table Simulator"
+        description="Simulate how your cap table evolves across multiple funding rounds. See the full dilution story from founding to Series C."
+        onReset={handleReset}
+        onCopy={handleCopy}
+      >
+        {/* Sub-tab bar */}
+        <div className="flex gap-1 mb-6 bg-slate-800/40 rounded-xl p-1 w-fit border border-slate-700/30">
+          {[
+            ["setup", "Setup"],
+            ["results", "Results"],
+          ].map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setSubTab(key)}
+              className={[
+                "px-5 py-1.5 rounded-lg text-sm font-medium transition-all",
+                subTab === key
+                  ? "bg-cyan-600 text-white shadow-md shadow-cyan-900/30"
+                  : "text-slate-400 hover:text-slate-200",
+              ].join(" ")}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* ── SETUP TAB ── */}
+        {subTab === "setup" && (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            {/* Founding Team */}
+            <div>
+              <SectionHeader>Founding Team</SectionHeader>
+
+              {noFounders && (
+                <InfoBanner variant="yellow">
+                  Add at least one founding shareholder to run the simulation.
+                </InfoBanner>
+              )}
+
+              <div className="space-y-1.5 mb-3">
+                {inputs.founders.map((f, idx) => (
+                  <div key={f.id} className="flex gap-1.5 items-center">
+                    <input
+                      type="text"
+                      value={f.name}
+                      onChange={(e) => updateFounder(f.id, "name", e.target.value)}
+                      placeholder={`Founder ${idx + 1}`}
+                      className="flex-1 min-w-0 bg-slate-800/80 border border-slate-600/70 rounded-lg px-2.5 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors"
+                    />
+                    <input
+                      type="number"
+                      value={f.shares}
+                      onChange={(e) => updateFounder(f.id, "shares", e.target.value)}
+                      placeholder="shares"
+                      className="w-32 bg-slate-800/80 border border-slate-600/70 rounded-lg px-2 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors appearance-none"
+                    />
+                    <button
+                      onClick={() => removeFounder(f.id)}
+                      disabled={inputs.founders.length <= 1}
+                      className="text-slate-600 hover:text-red-400 transition-colors w-5 shrink-0 text-lg leading-none text-center disabled:opacity-30 disabled:cursor-not-allowed"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              {inputs.founders.length < 10 && (
+                <button
+                  onClick={addFounder}
+                  className="text-xs text-cyan-400 hover:text-cyan-300 border border-cyan-600/30 hover:border-cyan-500/50 px-3 py-1.5 rounded-lg transition-colors w-full mb-4"
+                >
+                  + Add Founder
+                </button>
+              )}
+
+              <div className="mb-3">
+                <label className="block text-xs font-medium text-slate-400 mb-1">
+                  Initial Option Pool (Shares)
+                </label>
+                <input
+                  type="number"
+                  value={inputs.initialOptionPool}
+                  onChange={(e) => setField("initialOptionPool")(e.target.value)}
+                  placeholder="e.g. 500000"
+                  className="w-full bg-slate-800/80 border border-slate-600/70 rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/50 transition-colors appearance-none"
+                />
+              </div>
+
+              {/* Founding snapshot */}
+              {!noFounders && sr.stages && sr.stages[0] && (
+                <div className="mt-4 bg-slate-800/30 rounded-xl p-4 border border-slate-700/30">
+                  <p className="text-xs font-medium text-slate-500 uppercase tracking-wider mb-3">
+                    Founding Cap Table
+                  </p>
+                  {sr.stages[0].parties.map((p) => (
+                    <div
+                      key={String(p.id)}
+                      className="flex justify-between items-center py-1.5 border-b border-slate-700/30 last:border-0"
+                    >
+                      <span className="text-xs text-slate-300">{p.name}</span>
+                      <div className="flex items-center gap-3">
+                        <span className="text-xs text-slate-500">
+                          {fmtNum(p.shares)} shares
+                        </span>
+                        <span
+                          className="text-xs font-semibold tabular-nums"
+                          style={{ color: sr.partyColors?.[p.name] || "#94a3b8" }}
+                        >
+                          {fmtPct(p.pctDisplay, 1)}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                  <div className="flex justify-between items-center pt-2 mt-1">
+                    <span className="text-xs text-slate-400 font-medium">Total</span>
+                    <span className="text-xs text-white font-semibold">
+                      {fmtNum(sr.stages[0].total)} shares
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Funding Rounds */}
+            <div>
+              <SectionHeader>Funding Rounds</SectionHeader>
+              <div className="space-y-2">
+                {inputs.rounds.slice(0, inputs.activeRoundCount).map((round) => {
+                  const isExpanded = expandedRounds.has(round.id);
+                  const derived = roundDerived[round.id];
+                  const roundColor =
+                    sr.partyColors?.[round.investorName?.trim() || `Round ${round.id} Investor`] ||
+                    "#0ea5e9";
+                  return (
+                    <div
+                      key={round.id}
+                      className="bg-slate-800/40 border border-slate-700/30 rounded-xl overflow-hidden"
+                    >
+                      {/* Collapsible header */}
+                      <button
+                        onClick={() => toggleRound(round.id)}
+                        className="w-full flex items-center justify-between px-4 py-3 hover:bg-slate-700/20 transition-colors"
+                      >
+                        <div className="flex items-center gap-2">
+                          <div
+                            className="w-2 h-2 rounded-full shrink-0"
+                            style={{ background: roundColor }}
+                          />
+                          <span className="text-sm font-medium text-white">
+                            {round.name || `Round ${round.id}`}
+                          </span>
+                          {isFiniteNum(derived?.pps) && (
+                            <span className="text-xs text-cyan-400 ml-1">
+                              {fmtCurrency(derived.pps, currency, 2)}/share
+                            </span>
+                          )}
+                        </div>
+                        <span className="text-slate-500 text-xs select-none">
+                          {isExpanded ? "▲" : "▼"}
+                        </span>
+                      </button>
+
+                      {isExpanded && (
+                        <div className="px-4 pb-4 pt-3 space-y-2 border-t border-slate-700/30">
+                          <div className="grid grid-cols-2 gap-2">
+                            <div>
+                              <label className="block text-xs font-medium text-slate-400 mb-1">
+                                Round Name
+                              </label>
+                              <input
+                                type="text"
+                                value={round.name}
+                                onChange={(e) => updateRound(round.id, "name", e.target.value)}
+                                className="w-full bg-slate-700/50 border border-slate-600/50 rounded-lg px-2.5 py-1.5 text-white text-xs focus:outline-none focus:border-cyan-500 transition-colors"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium text-slate-400 mb-1">
+                                Investor Name
+                              </label>
+                              <input
+                                type="text"
+                                value={round.investorName}
+                                onChange={(e) =>
+                                  updateRound(round.id, "investorName", e.target.value)
+                                }
+                                className="w-full bg-slate-700/50 border border-slate-600/50 rounded-lg px-2.5 py-1.5 text-white text-xs focus:outline-none focus:border-cyan-500 transition-colors"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-2">
+                            <div>
+                              <label className="block text-xs font-medium text-slate-400 mb-1">
+                                Pre-Money Valuation
+                              </label>
+                              <div className="relative">
+                                <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-xs pointer-events-none">
+                                  {currSymbol}
+                                </span>
+                                <input
+                                  type="number"
+                                  value={round.preMoney}
+                                  onChange={(e) =>
+                                    updateRound(round.id, "preMoney", e.target.value)
+                                  }
+                                  placeholder="e.g. 5000000"
+                                  className="w-full bg-slate-700/50 border border-slate-600/50 rounded-lg pl-6 pr-2 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors appearance-none"
+                                />
+                              </div>
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium text-slate-400 mb-1">
+                                Investment Amount
+                              </label>
+                              <div className="relative">
+                                <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-xs pointer-events-none">
+                                  {currSymbol}
+                                </span>
+                                <input
+                                  type="number"
+                                  value={round.investment}
+                                  onChange={(e) =>
+                                    updateRound(round.id, "investment", e.target.value)
+                                  }
+                                  placeholder="e.g. 1000000"
+                                  className="w-full bg-slate-700/50 border border-slate-600/50 rounded-lg pl-6 pr-2 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors appearance-none"
+                                />
+                              </div>
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="block text-xs font-medium text-slate-400 mb-1">
+                              New Option Pool Shares Added
+                            </label>
+                            <input
+                              type="number"
+                              value={round.optionPool}
+                              onChange={(e) =>
+                                updateRound(round.id, "optionPool", e.target.value)
+                              }
+                              placeholder="e.g. 250000"
+                              className="w-full bg-slate-700/50 border border-slate-600/50 rounded-lg px-2.5 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors appearance-none"
+                            />
+                          </div>
+
+                          {/* Derived read-only fields */}
+                          <div className="grid grid-cols-2 gap-2 pt-1">
+                            <div className="bg-slate-700/30 rounded-lg px-3 py-2">
+                              <p className="text-xs text-slate-500 mb-0.5">Price Per Share</p>
+                              <p className="text-sm font-semibold text-cyan-300">
+                                {fmtCurrency(derived?.pps, currency, 2)}
+                              </p>
+                            </div>
+                            <div className="bg-slate-700/30 rounded-lg px-3 py-2">
+                              <p className="text-xs text-slate-500 mb-0.5">Post-Money</p>
+                              <p className="text-sm font-semibold text-cyan-300">
+                                {fmtCurrency(derived?.postMoney, currency)}
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {inputs.activeRoundCount < 5 && (
+                <button
+                  onClick={addRound}
+                  className="mt-3 text-xs text-cyan-400 hover:text-cyan-300 border border-cyan-600/30 hover:border-cyan-500/50 px-3 py-1.5 rounded-lg transition-colors w-full"
+                >
+                  + Add Round
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── RESULTS TAB ── */}
+        {subTab === "results" && (
+          <div>
+            {noFounders ? (
+              <InfoBanner variant="yellow">
+                Add at least one founding shareholder on the Setup tab to see results.
+              </InfoBanner>
+            ) : !sr.stages || sr.stages.length === 0 ? (
+              <InfoBanner variant="slate">
+                Configure at least one funding round on the Setup tab to see results.
+              </InfoBanner>
+            ) : (
+              <div className="space-y-8">
+                {/* Multi-column ownership evolution table */}
+                <div>
+                  <SectionHeader>Ownership Evolution</SectionHeader>
+                  <div className="overflow-x-auto rounded-xl border border-slate-700/30">
+                    <table className="w-full min-w-max text-xs border-collapse">
+                      <thead>
+                        <tr className="bg-slate-700/30">
+                          <th className="px-4 py-3 text-left text-slate-400 font-semibold whitespace-nowrap w-36 sticky left-0 bg-slate-700/30">
+                            Shareholder
+                          </th>
+                          {sr.stages.map((stage) => (
+                            <th
+                              key={stage.stageKey}
+                              className="px-4 py-3 text-right text-slate-400 font-semibold whitespace-nowrap"
+                            >
+                              {stage.label}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {sr.partyOrder.map((name, rowIdx) => (
+                          <tr
+                            key={name}
+                            className={rowIdx % 2 !== 0 ? "bg-slate-800/20" : ""}
+                          >
+                            <td className="px-4 py-2.5 font-medium whitespace-nowrap sticky left-0 bg-[#1e293b]">
+                              <div className="flex items-center gap-2">
+                                <div
+                                  className="w-2 h-2 rounded-sm shrink-0"
+                                  style={{ background: sr.partyColors?.[name] || "#94a3b8" }}
+                                />
+                                <span className="text-slate-200 max-w-32 truncate">{name}</span>
+                              </div>
+                            </td>
+                            {sr.stages.map((stage, stageIdx) => {
+                              const p = stage.parties.find((pp) => pp.name === name);
+                              const prev = stageIdx > 0 ? sr.stages[stageIdx - 1] : null;
+                              const prevP = prev?.parties.find((pp) => pp.name === name);
+                              const delta =
+                                p && prevP
+                                  ? parseFloat((p.pctDisplay - prevP.pctDisplay).toFixed(2))
+                                  : null;
+                              return (
+                                <td
+                                  key={stage.stageKey}
+                                  className="px-4 py-2.5 text-right whitespace-nowrap"
+                                >
+                                  {p ? (
+                                    <div>
+                                      <span
+                                        className="font-semibold tabular-nums"
+                                        style={{ color: sr.partyColors?.[name] || "#e2e8f0" }}
+                                      >
+                                        {fmtPct(p.pctDisplay, 2)}
+                                      </span>
+                                      {isFiniteNum(delta) && Math.abs(delta) > 0.005 && (
+                                        <div
+                                          className={`text-xs mt-0.5 tabular-nums ${
+                                            delta < 0 ? "text-red-400" : "text-emerald-400"
+                                          }`}
+                                        >
+                                          {delta < 0 ? "−" : "+"}
+                                          {Math.abs(delta).toFixed(2)}%
+                                        </div>
+                                      )}
+                                    </div>
+                                  ) : (
+                                    <span className="text-slate-600">—</span>
+                                  )}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* Stacked area chart */}
+                {sr.areaChartData && sr.areaChartData.length >= 2 && (
+                  <div>
+                    <SectionHeader>Ownership Over Time</SectionHeader>
+                    <div className="bg-slate-800/30 rounded-xl p-4 border border-slate-700/30">
+                      <div className="h-64">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <AreaChart
+                            data={sr.areaChartData}
+                            margin={{ top: 8, right: 16, left: 0, bottom: 0 }}
+                          >
+                            <XAxis
+                              dataKey="stage"
+                              tick={{ fill: "#94a3b8", fontSize: 11 }}
+                              axisLine={false}
+                              tickLine={false}
+                            />
+                            <YAxis
+                              domain={[0, 100]}
+                              tickFormatter={(v) => `${v}%`}
+                              tick={{ fill: "#64748b", fontSize: 10 }}
+                              axisLine={false}
+                              tickLine={false}
+                              width={36}
+                            />
+                            <Tooltip
+                              formatter={(val, name) => [
+                                `${Number(val).toFixed(1)}%`,
+                                name,
+                              ]}
+                              contentStyle={{
+                                background: "#1e293b",
+                                border: "1px solid #334155",
+                                borderRadius: "8px",
+                                fontSize: "11px",
+                                color: "#cbd5e1",
+                              }}
+                            />
+                            {sr.partyOrder.map((name) => (
+                              <Area
+                                key={name}
+                                type="monotone"
+                                dataKey={name}
+                                stackId="1"
+                                stroke={sr.partyColors?.[name] || "#94a3b8"}
+                                fill={sr.partyColors?.[name] || "#94a3b8"}
+                                fillOpacity={0.72}
+                                strokeWidth={1.5}
+                              />
+                            ))}
+                          </AreaChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <div className="flex flex-wrap gap-x-4 gap-y-1.5 mt-3">
+                        {sr.partyOrder.map((name) => (
+                          <div key={name} className="flex items-center gap-1.5">
+                            <div
+                              className="w-2.5 h-2.5 rounded-sm shrink-0"
+                              style={{ background: sr.partyColors?.[name] || "#94a3b8" }}
+                            />
+                            <span className="text-xs text-slate-400">{name}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Round summary table */}
+                {sr.stages.filter((s) => s.roundId).length > 0 && (
+                  <div>
+                    <SectionHeader>Round Summary</SectionHeader>
+                    <div className="overflow-x-auto rounded-xl border border-slate-700/30">
+                      <table className="w-full min-w-max text-xs border-collapse">
+                        <thead>
+                          <tr className="bg-slate-700/30">
+                            {[
+                              "Round",
+                              "Pre-Money",
+                              "Investment",
+                              "Post-Money",
+                              "Price / Share",
+                              "Shares Issued",
+                            ].map((h) => (
+                              <th
+                                key={h}
+                                className="px-4 py-3 text-left text-slate-400 font-semibold whitespace-nowrap"
+                              >
+                                {h}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {sr.stages
+                            .filter((s) => s.roundId)
+                            .map((stage, idx) => (
+                              <tr
+                                key={stage.stageKey}
+                                className={idx % 2 !== 0 ? "bg-slate-800/20" : ""}
+                              >
+                                <td className="px-4 py-2.5 text-white font-medium whitespace-nowrap">
+                                  {stage.label}
+                                </td>
+                                <td className="px-4 py-2.5 text-slate-300 whitespace-nowrap">
+                                  {fmtCurrency(stage.preMoney, currency)}
+                                </td>
+                                <td className="px-4 py-2.5 text-slate-300 whitespace-nowrap">
+                                  {fmtCurrency(stage.investment, currency)}
+                                </td>
+                                <td className="px-4 py-2.5 text-cyan-300 font-medium whitespace-nowrap">
+                                  {fmtCurrency(stage.postMoney, currency)}
+                                </td>
+                                <td className="px-4 py-2.5 text-slate-300 whitespace-nowrap">
+                                  {fmtCurrency(stage.pps, currency, 2)}
+                                </td>
+                                <td className="px-4 py-2.5 text-slate-300 whitespace-nowrap">
+                                  {fmtNum(stage.newInvestorShares)}
+                                </td>
+                              </tr>
+                            ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </CalcCard>
+    </>
+  );
+}
+
 // ─── Calculator Registry ──────────────────────────────────────────────────────
 
 const CALCULATORS = [
@@ -813,6 +2261,16 @@ const CALCULATORS = [
     id: "safe-note",
     label: "SAFE / Note",
     Component: SafeNoteCalculator,
+  },
+  {
+    id: "dilution",
+    label: "Dilution",
+    Component: DilutionCalculator,
+  },
+  {
+    id: "cap-table",
+    label: "Cap Table",
+    Component: CapTableSimulator,
   },
 ];
 
