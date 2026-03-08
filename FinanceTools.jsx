@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useMemo } from "react";
 import PortfolioMonitor from "./PortfolioMonitor";
+import StartupDatabase from "./StartupDatabase";
 import {
   BarChart,
   Bar,
@@ -5096,6 +5097,11 @@ const CALCULATORS = [
     id: "portfolio-monitor",
     label: "Portfolio",
     Component: PortfolioMonitor,
+  },
+  {
+    id: "startup-database",
+    label: "Startup DB",
+    Component: StartupDatabase,
   },
 ];
 
