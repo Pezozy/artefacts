@@ -85,6 +85,24 @@ const fmtNumExact = (val, decimals = 2) => {
   });
 };
 
+/**
+ * Universal safe formatter — define once, use everywhere.
+ * Never renders raw computed values directly into JSX.
+ */
+const fmt = (val, type, currency = "USD") => {
+  if (val === null || val === undefined || (typeof val === "number" && !isFinite(val))) return "—";
+  if (type === "currency") {
+    const sym = CURRENCY_META[currency]?.symbol || "$";
+    const abs = Math.abs(val);
+    const sign = val < 0 ? "-" : "";
+    return `${sign}${sym}${Math.round(abs).toLocaleString("en-US")}`;
+  }
+  if (type === "percent") return `${Number(val).toFixed(2)}%`;
+  if (type === "multiple") return `${Number(val).toFixed(2)}x`;
+  if (type === "number") return Number(val).toLocaleString("en-US");
+  return String(val);
+};
+
 // ─── Error Boundary ───────────────────────────────────────────────────────────
 
 class CalcErrorBoundary extends React.Component {
@@ -123,11 +141,15 @@ function InputField({
   warning,
   disabled,
   step,
+  tooltip,
 }) {
   const currSymbol = prefix || "";
   return (
     <div className="mb-3">
-      <label className="block text-xs font-medium text-slate-400 mb-1">{label}</label>
+      <label className="block text-xs font-medium text-slate-400 mb-1">
+        {label}
+        {tooltip && <FieldTooltip text={tooltip} />}
+      </label>
       <div className="relative flex items-center">
         {currSymbol && (
           <span className="absolute left-3 text-slate-400 text-sm pointer-events-none select-none z-10">
@@ -214,11 +236,41 @@ function InfoBanner({ children, variant = "yellow" }) {
     yellow: "bg-yellow-950/30 border-yellow-600/30 text-yellow-300",
     blue: "bg-cyan-950/30 border-cyan-600/30 text-cyan-300",
     slate: "bg-slate-800/50 border-slate-600/30 text-slate-400",
+    red: "bg-red-950/30 border-red-600/30 text-red-300",
+    green: "bg-green-950/30 border-green-600/30 text-green-300",
   };
   return (
-    <div className={`border rounded-lg px-4 py-3 mb-4 text-xs leading-relaxed ${styles[variant]}`}>
+    <div className={`border rounded-lg px-4 py-3 mb-4 text-xs leading-relaxed ${styles[variant] || styles.slate}`}>
       {children}
     </div>
+  );
+}
+
+// ─── Tooltip ──────────────────────────────────────────────────────────────────
+
+function FieldTooltip({ text }) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <span className="relative inline-flex items-center ml-1 align-middle">
+      <button
+        type="button"
+        onMouseEnter={() => setVisible(true)}
+        onMouseLeave={() => setVisible(false)}
+        onFocus={() => setVisible(true)}
+        onBlur={() => setVisible(false)}
+        onClick={(e) => { e.preventDefault(); setVisible((v) => !v); }}
+        className="w-3.5 h-3.5 rounded-full bg-slate-700 text-slate-400 text-[9px] font-bold inline-flex items-center justify-center hover:bg-slate-600 hover:text-white transition-colors cursor-help shrink-0 leading-none"
+        aria-label="Field information"
+      >
+        ?
+      </button>
+      {visible && (
+        <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-50 w-56 bg-slate-800 border border-slate-600/50 rounded-lg px-3 py-2 text-xs text-slate-300 leading-relaxed shadow-2xl pointer-events-none whitespace-normal">
+          {text}
+          <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-slate-600/50" />
+        </div>
+      )}
+    </span>
   );
 }
 
@@ -3684,6 +3736,1320 @@ function VCSimulator({ currency }) {
 
 // ─── Calculator Registry ──────────────────────────────────────────────────────
 
+// ─── Calculator 6 — Waterfall / Exit Distribution ────────────────────────────
+
+const WF_PARTICIPATION_OPTS = ["None", "Participating (Uncapped)", "Participating (Capped)"];
+const WF_BAR_COLORS = [
+  "#3b82f6","#8b5cf6","#ec4899","#f59e0b","#06b6d4",
+  "#10b981","#ef4444","#f97316","#84cc16","#6366f1",
+  "#14b8a6","#f43f5e","#a855f7","#22c55e","#0ea5e9",
+];
+
+const mkInv = (id, seniority) => ({
+  id, name: "", amountInvested: "", prefMultiple: "1",
+  participation: "None", capMultiple: "", seniority: String(seniority), ownershipPct: "",
+});
+const mkCS = (id) => ({ id, name: "", ownershipPct: "" });
+
+const WF_DEFAULTS = {
+  exitProceeds: "",
+  investors: [mkInv(1, 1), mkInv(2, 2)],
+  common: [mkCS(1), mkCS(2)],
+};
+
+function runWaterfall(exitProceedsRaw, investors, common) {
+  const exit = parseVal(exitProceedsRaw);
+  if (!isFiniteNum(exit)) return null;
+
+  const invs = investors
+    .map((inv) => ({
+      ...inv,
+      amountNum: parseVal(inv.amountInvested),
+      prefMult: Math.max(0, parseVal(inv.prefMultiple) ?? 1),
+      capMult: parseVal(inv.capMultiple),
+      seniorityNum: parseVal(inv.seniority) ?? 999,
+      ownPct: parseVal(inv.ownershipPct),
+    }))
+    .filter((inv) => isFiniteNum(inv.amountNum) && inv.amountNum > 0);
+
+  if (invs.length === 0) return { exit, invs: [], csParsed: [], noInvestors: true };
+
+  const sorted = [...invs].sort((a, b) => a.seniorityNum - b.seniorityNum);
+  let remaining = exit;
+
+  // Step 1: Liquidation preferences in seniority order
+  const prefPaid = {};
+  const prefAmt = {};
+  for (const inv of sorted) {
+    const pa = inv.amountNum * inv.prefMult;
+    prefAmt[inv.id] = pa;
+    const paid = Math.min(pa, Math.max(0, remaining));
+    prefPaid[inv.id] = paid;
+    remaining = Math.max(0, remaining - paid);
+  }
+
+  const insufficientPrefs = remaining === 0 &&
+    sorted.some((inv) => prefPaid[inv.id] < prefAmt[inv.id]);
+
+  // Step 2: Participating preferred — iterative cap resolution
+  const csParsed = common
+    .map((cs) => ({ ...cs, ownNum: parseVal(cs.ownershipPct) }))
+    .filter((cs) => isFiniteNum(cs.ownNum) && cs.ownNum > 0);
+
+  const totalCSOwn = csParsed.reduce((s, c) => s + c.ownNum, 0);
+  const partAmt = {};
+  invs.forEach((inv) => { partAmt[inv.id] = 0; });
+
+  let pool = remaining;
+  let activeParts = invs.filter(
+    (inv) => inv.participation !== "None" && isFiniteNum(inv.ownPct) && inv.ownPct > 0
+  );
+
+  for (let iter = 0; iter < 20 && pool > 1e-6 && activeParts.length > 0; iter++) {
+    const activePartOwn = activeParts.reduce((s, p) => s + p.ownPct, 0);
+    const totalOwn = activePartOwn + totalCSOwn;
+    if (totalOwn <= 0) break;
+
+    let anyCapped = false;
+    let consumed = 0;
+    const nextActive = [];
+
+    for (const p of activeParts) {
+      const fraction = p.ownPct / totalOwn;
+      const tentShare = pool * fraction;
+      const currentTotal = (prefPaid[p.id] ?? 0) + partAmt[p.id];
+
+      if (p.participation === "Participating (Capped)" && isFiniteNum(p.capMult) && p.capMult > 0) {
+        const cap = p.amountNum * p.capMult;
+        if (currentTotal + tentShare > cap) {
+          const allowed = Math.max(0, cap - currentTotal);
+          partAmt[p.id] += allowed;
+          consumed += allowed;
+          anyCapped = true;
+        } else {
+          nextActive.push(p);
+        }
+      } else {
+        nextActive.push(p);
+      }
+    }
+
+    if (!anyCapped) {
+      for (const p of activeParts) {
+        partAmt[p.id] += pool * (p.ownPct / totalOwn);
+      }
+      pool = totalOwn > 0 ? pool * totalCSOwn / totalOwn : 0;
+      break;
+    } else {
+      pool -= consumed;
+      activeParts = nextActive;
+    }
+  }
+
+  const commonPool = Math.max(0, pool);
+
+  // Distribute common pool pro-rata to common shareholders
+  const csAmt = {};
+  csParsed.forEach((cs) => {
+    csAmt[cs.id] = totalCSOwn > 0 ? commonPool * (cs.ownNum / totalCSOwn) : 0;
+  });
+
+  // As-converted comparison for non-participating preferred
+  const asConverted = {};
+  const totalAllOwn =
+    invs.reduce((s, p) => s + (isFiniteNum(p.ownPct) ? p.ownPct : 0), 0) + totalCSOwn;
+
+  for (const inv of invs) {
+    if (inv.participation !== "None" || !isFiniteNum(inv.ownPct)) {
+      asConverted[inv.id] = null;
+      continue;
+    }
+    // Run preferences for all OTHER investors to find pool investor i would share as common
+    let remForConv = exit;
+    for (const other of sorted) {
+      if (other.id === inv.id) continue;
+      const op = other.amountNum * other.prefMult;
+      remForConv = Math.max(0, remForConv - Math.min(op, remForConv));
+    }
+    asConverted[inv.id] = totalAllOwn > 0 ? remForConv * (inv.ownPct / totalAllOwn) : 0;
+  }
+
+  const totalPrefPaid = Object.values(prefPaid).reduce((s, v) => s + v, 0);
+  const totalPartPaid = Object.values(partAmt).reduce((s, v) => s + v, 0);
+  const breakeven = invs.reduce((s, inv) => s + inv.amountNum * inv.prefMult, 0);
+
+  return {
+    exit, invs, sorted, prefPaid, prefAmt, partAmt,
+    csParsed, csAmt, asConverted, commonPool,
+    totalPrefPaid, totalPartPaid, totalCommonPaid: commonPool,
+    breakeven, insufficientPrefs,
+  };
+}
+
+function WaterfallCalculator({ currency }) {
+  const [inputs, setInputs] = useState(WF_DEFAULTS);
+  const [copyFn, CopyModalNode] = useCopyToClipboard();
+
+  const setField = useCallback(
+    (field) => (val) => setInputs((prev) => ({ ...prev, [field]: val })), []
+  );
+  const addInvestor = useCallback(() => {
+    setInputs((prev) => {
+      if (prev.investors.length >= 15) return prev;
+      return { ...prev, investors: [...prev.investors, mkInv(Date.now(), prev.investors.length + 1)] };
+    });
+  }, []);
+  const removeInvestor = useCallback((id) => {
+    setInputs((prev) => ({ ...prev, investors: prev.investors.filter((i) => i.id !== id) }));
+  }, []);
+  const updateInvestor = useCallback((id, field, val) => {
+    setInputs((prev) => ({
+      ...prev,
+      investors: prev.investors.map((inv) => inv.id === id ? { ...inv, [field]: val } : inv),
+    }));
+  }, []);
+  const addCommon = useCallback(() => {
+    setInputs((prev) => ({ ...prev, common: [...prev.common, mkCS(Date.now())] }));
+  }, []);
+  const removeCommon = useCallback((id) => {
+    setInputs((prev) => ({ ...prev, common: prev.common.filter((cs) => cs.id !== id) }));
+  }, []);
+  const updateCommon = useCallback((id, field, val) => {
+    setInputs((prev) => ({
+      ...prev,
+      common: prev.common.map((cs) => cs.id === id ? { ...cs, [field]: val } : cs),
+    }));
+  }, []);
+
+  const r = useMemo(
+    () => runWaterfall(inputs.exitProceeds, inputs.investors, inputs.common),
+    [inputs.exitProceeds, inputs.investors, inputs.common]
+  );
+
+  const commonSum = useMemo(
+    () => inputs.common.reduce((s, cs) => s + (parseVal(cs.ownershipPct) ?? 0), 0),
+    [inputs.common]
+  );
+
+  // Build stacked bar chart data
+  const chartParties = useMemo(() => {
+    if (!r || r.noInvestors) return null;
+    const parties = [
+      ...r.invs.map((inv, i) => ({
+        name: inv.name || `Investor ${i + 1}`,
+        value: (r.prefPaid[inv.id] ?? 0) + (r.partAmt[inv.id] ?? 0),
+        color: WF_BAR_COLORS[i % WF_BAR_COLORS.length],
+      })),
+      ...r.csParsed.map((cs, i) => ({
+        name: cs.name || "Common",
+        value: r.csAmt[cs.id] ?? 0,
+        color: WF_BAR_COLORS[(r.invs.length + i) % WF_BAR_COLORS.length],
+      })),
+    ].filter((p) => p.value > 0.01);
+    return parties;
+  }, [r]);
+
+  const stackedBarData = useMemo(() => {
+    if (!chartParties) return null;
+    const row = { name: "Exit" };
+    chartParties.forEach((p, i) => { row[`p${i}`] = p.value; });
+    return [row];
+  }, [chartParties]);
+
+  const handleReset = useCallback(() => setInputs(WF_DEFAULTS), []);
+  const handleCopy = useCallback(() => {
+    if (!r) { copyFn("No results to copy."); return; }
+    const lines = [
+      "Waterfall / Exit Distribution",
+      "==============================",
+      `Exit Proceeds:             ${fmt(r.exit, "currency", currency)}`,
+      `Breakeven (all prefs):     ${fmt(r.breakeven, "currency", currency)}`,
+      `Total to Preferred Stack:  ${fmt(r.totalPrefPaid + r.totalPartPaid, "currency", currency)}`,
+      `Total to Common:           ${fmt(r.totalCommonPaid, "currency", currency)}`,
+      "",
+      "Investor Distribution:",
+      ...r.invs.map((inv) => {
+        const total = (r.prefPaid[inv.id] ?? 0) + (r.partAmt[inv.id] ?? 0);
+        return `  ${inv.name || "(unnamed)"}: ${fmt(total, "currency", currency)}`;
+      }),
+      "",
+      "Common Shareholder Distribution:",
+      ...r.csParsed.map((cs) => `  ${cs.name || "(common)"}: ${fmt(r.csAmt[cs.id], "currency", currency)}`),
+    ];
+    copyFn(lines.join("\n"));
+  }, [r, currency, copyFn]);
+
+  const currSymbol = CURRENCY_META[currency]?.symbol || "$";
+
+  return (
+    <>
+      {CopyModalNode}
+      <CalcCard
+        title="Waterfall / Exit Distribution Calculator"
+        description="Model exactly how exit proceeds are distributed to each investor and shareholder, accounting for liquidation preferences, participation rights, and common equity."
+        onReset={handleReset}
+        onCopy={handleCopy}
+      >
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+          {/* ── Left: Inputs ── */}
+          <div>
+            <SectionHeader>Exit Proceeds</SectionHeader>
+            <InputField
+              label="Total Exit Proceeds"
+              value={inputs.exitProceeds}
+              onChange={setField("exitProceeds")}
+              placeholder="e.g. 50000000"
+              prefix={currSymbol}
+              tooltip="Total amount available to distribute from the exit — acquisition price, IPO net proceeds, etc."
+            />
+
+            {/* Investor Preference Stack */}
+            <div className="mt-4">
+              <div className="flex items-center justify-between mb-2">
+                <SectionHeader>Investor Preference Stack</SectionHeader>
+                <span className="text-xs text-slate-600 pb-3">{inputs.investors.length}/15</span>
+              </div>
+              <div className="space-y-3">
+                {inputs.investors.map((inv) => {
+                  const showCap = inv.participation === "Participating (Capped)";
+                  const capNum = parseVal(inv.capMultiple);
+                  const prefNum = parseVal(inv.prefMultiple) ?? 1;
+                  const capWarn = showCap && isFiniteNum(capNum) && capNum < prefNum
+                    ? "Participation cap is lower than liquidation preference — cap has no practical effect."
+                    : null;
+                  return (
+                    <div key={inv.id} className="bg-slate-800/40 border border-slate-700/30 rounded-xl p-3 space-y-2">
+                      {/* Row 1: name + seniority + remove */}
+                      <div className="flex gap-2 items-center">
+                        <input
+                          type="text"
+                          value={inv.name}
+                          onChange={(e) => updateInvestor(inv.id, "name", e.target.value)}
+                          placeholder="Investor Name"
+                          className="flex-1 bg-slate-900/60 border border-slate-600/70 rounded-lg px-2 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors"
+                        />
+                        <div className="relative w-20 shrink-0">
+                          <span className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-500 text-[10px] pointer-events-none">Sen.</span>
+                          <input
+                            type="number"
+                            value={inv.seniority}
+                            onChange={(e) => updateInvestor(inv.id, "seniority", e.target.value)}
+                            min="1"
+                            className="w-full bg-slate-900/60 border border-slate-600/70 rounded-lg pl-8 pr-2 py-1.5 text-white text-xs focus:outline-none focus:border-cyan-500 transition-colors appearance-none"
+                          />
+                        </div>
+                        <button
+                          onClick={() => removeInvestor(inv.id)}
+                          className="text-slate-600 hover:text-red-400 text-lg leading-none transition-colors shrink-0"
+                        >×</button>
+                      </div>
+                      {/* Row 2: amount + pref multiple */}
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="relative">
+                          <span className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-500 text-xs pointer-events-none">{currSymbol}</span>
+                          <input
+                            type="number"
+                            value={inv.amountInvested}
+                            onChange={(e) => updateInvestor(inv.id, "amountInvested", e.target.value)}
+                            placeholder="Amount invested"
+                            className="w-full bg-slate-900/60 border border-slate-600/70 rounded-lg pl-5 pr-2 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors appearance-none"
+                          />
+                        </div>
+                        <div className="relative">
+                          <input
+                            type="number"
+                            value={inv.prefMultiple}
+                            onChange={(e) => updateInvestor(inv.id, "prefMultiple", e.target.value)}
+                            placeholder="Pref. multiple"
+                            className="w-full bg-slate-900/60 border border-slate-600/70 rounded-lg px-2 pr-7 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors appearance-none"
+                          />
+                          <span className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 text-xs pointer-events-none">×</span>
+                        </div>
+                      </div>
+                      {/* Row 3: participation dropdown + ownership % */}
+                      <div className="grid grid-cols-2 gap-2">
+                        <select
+                          value={inv.participation}
+                          onChange={(e) => updateInvestor(inv.id, "participation", e.target.value)}
+                          className="w-full bg-slate-900/60 border border-slate-600/70 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-cyan-500 transition-colors"
+                        >
+                          {WF_PARTICIPATION_OPTS.map((o) => (
+                            <option key={o} value={o}>{o}</option>
+                          ))}
+                        </select>
+                        <div className="relative">
+                          <input
+                            type="number"
+                            value={inv.ownershipPct}
+                            onChange={(e) => updateInvestor(inv.id, "ownershipPct", e.target.value)}
+                            placeholder="Common own %"
+                            className="w-full bg-slate-900/60 border border-slate-600/70 rounded-lg px-2 pr-6 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors appearance-none"
+                          />
+                          <span className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 text-xs pointer-events-none">%</span>
+                        </div>
+                      </div>
+                      {/* Conditional cap field */}
+                      {showCap && (
+                        <>
+                          <div className="relative">
+                            <input
+                              type="number"
+                              value={inv.capMultiple}
+                              onChange={(e) => updateInvestor(inv.id, "capMultiple", e.target.value)}
+                              placeholder="Participation cap (e.g. 3×)"
+                              className="w-full bg-slate-900/60 border border-slate-600/70 rounded-lg px-2 pr-7 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors appearance-none"
+                            />
+                            <span className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 text-xs pointer-events-none">×</span>
+                          </div>
+                          {capWarn && <p className="text-xs text-yellow-400">{capWarn}</p>}
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              {inputs.investors.length < 15 && (
+                <button
+                  onClick={addInvestor}
+                  className="mt-3 text-xs text-cyan-400 hover:text-cyan-300 border border-cyan-600/30 hover:border-cyan-500/50 px-3 py-1.5 rounded-lg transition-colors w-full"
+                >
+                  + Add Investor
+                </button>
+              )}
+            </div>
+
+            {/* Common Shareholders */}
+            <div className="mt-6">
+              <div className="flex items-center justify-between mb-2">
+                <SectionHeader>Common Shareholders</SectionHeader>
+                <span className={`text-xs pb-3 font-semibold tabular-nums ${Math.abs(commonSum - 100) < 0.01 || commonSum === 0 ? "text-slate-600" : "text-yellow-400"}`}>
+                  {commonSum.toFixed(1)}%
+                </span>
+              </div>
+              {commonSum > 0 && Math.abs(commonSum - 100) > 0.01 && (
+                <InfoBanner variant="yellow">
+                  Common ownership percentages sum to {commonSum.toFixed(1)}% — normalized to 100% for distribution.
+                </InfoBanner>
+              )}
+              <div className="space-y-2">
+                {inputs.common.map((cs) => (
+                  <div key={cs.id} className="flex gap-2">
+                    <input
+                      type="text"
+                      value={cs.name}
+                      onChange={(e) => updateCommon(cs.id, "name", e.target.value)}
+                      placeholder="Name (e.g. Founders)"
+                      className="flex-1 bg-slate-800/60 border border-slate-600/70 rounded-lg px-2 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors"
+                    />
+                    <div className="relative w-24 shrink-0">
+                      <input
+                        type="number"
+                        value={cs.ownershipPct}
+                        onChange={(e) => updateCommon(cs.id, "ownershipPct", e.target.value)}
+                        placeholder="Own %"
+                        className="w-full bg-slate-800/60 border border-slate-600/70 rounded-lg px-2 pr-6 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors appearance-none"
+                      />
+                      <span className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 text-xs pointer-events-none">%</span>
+                    </div>
+                    <button
+                      onClick={() => removeCommon(cs.id)}
+                      className="text-slate-600 hover:text-red-400 text-lg leading-none transition-colors shrink-0"
+                    >×</button>
+                  </div>
+                ))}
+              </div>
+              <button
+                onClick={addCommon}
+                className="mt-2 text-xs text-cyan-400 hover:text-cyan-300 border border-cyan-600/30 hover:border-cyan-500/50 px-3 py-1.5 rounded-lg transition-colors w-full"
+              >
+                + Add Common Shareholder
+              </button>
+            </div>
+          </div>
+
+          {/* ── Right: Results ── */}
+          <div>
+            <SectionHeader>Distribution Results</SectionHeader>
+            {!r && (
+              <InfoBanner variant="slate">
+                Enter Exit Proceeds and at least one investor with an Amount Invested to calculate the waterfall.
+              </InfoBanner>
+            )}
+            {r?.noInvestors && (
+              <InfoBanner variant="slate">
+                Add at least one investor with an Amount Invested to calculate the waterfall.
+              </InfoBanner>
+            )}
+            {r?.insufficientPrefs && (
+              <InfoBanner variant="red">
+                Exit proceeds are insufficient to fully cover all liquidation preferences.
+                Senior investors are paid first — junior investors and common shareholders may receive nothing.
+              </InfoBanner>
+            )}
+
+            {r && !r.noInvestors && (
+              <>
+                {/* Summary stats */}
+                <div className="bg-slate-800/40 rounded-xl p-4 border border-slate-700/30 mb-4">
+                  <ResultRow label="Total Exit Proceeds" value={fmt(r.exit, "currency", currency)} highlight />
+                  <ResultRow label="Total to Preferred Stack" value={fmt(r.totalPrefPaid + r.totalPartPaid, "currency", currency)} />
+                  <ResultRow label="Total to Common" value={fmt(r.totalCommonPaid, "currency", currency)} />
+                  <ResultRow
+                    label="% Returned to Investors"
+                    value={isFiniteNum(r.exit) && r.exit > 0
+                      ? fmt(((r.totalPrefPaid + r.totalPartPaid) / r.exit) * 100, "percent")
+                      : "—"}
+                  />
+                  <ResultRow
+                    label="Breakeven Exit (full pref coverage)"
+                    value={fmt(r.breakeven, "currency", currency)}
+                    note="Minimum exit at which all liquidation preferences are fully covered."
+                  />
+                </div>
+
+                {/* Per-stakeholder waterfall table */}
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs min-w-[480px]">
+                    <thead>
+                      <tr className="text-slate-500 border-b border-slate-700/50">
+                        <th className="text-left pb-2 font-medium pr-2">Name</th>
+                        <th className="text-right pb-2 font-medium">Pref</th>
+                        <th className="text-right pb-2 font-medium">Part.</th>
+                        <th className="text-right pb-2 font-medium">Total</th>
+                        <th className="text-right pb-2 font-medium">% Exit</th>
+                        <th className="text-right pb-2 font-medium">As-Conv.</th>
+                        <th className="text-right pb-2 font-medium">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {r.invs.map((inv) => {
+                        const total = (r.prefPaid[inv.id] ?? 0) + (r.partAmt[inv.id] ?? 0);
+                        const pctExit = r.exit > 0 ? (total / r.exit) * 100 : null;
+                        const ac = r.asConverted[inv.id];
+                        const acDiff = isFiniteNum(ac) ? ac - total : null;
+                        const action = inv.participation !== "None" ? "—"
+                          : isFiniteNum(acDiff) ? (acDiff > 1 ? "Convert" : "Preference") : "—";
+                        const actionColor = action === "Convert" ? "text-green-400"
+                          : action === "Preference" ? "text-cyan-400" : "text-slate-600";
+                        return (
+                          <tr key={inv.id} className="border-b border-slate-800/60 hover:bg-slate-800/20">
+                            <td className="py-2 text-slate-300 truncate max-w-[72px] pr-2">
+                              {inv.name || "(unnamed)"}
+                            </td>
+                            <td className="py-2 text-right text-slate-400 tabular-nums">
+                              {fmt(r.prefPaid[inv.id], "currency", currency)}
+                            </td>
+                            <td className="py-2 text-right text-slate-400 tabular-nums">
+                              {r.partAmt[inv.id] > 0.01 ? fmt(r.partAmt[inv.id], "currency", currency) : "—"}
+                            </td>
+                            <td className="py-2 text-right text-white font-semibold tabular-nums">
+                              {fmt(total, "currency", currency)}
+                            </td>
+                            <td className="py-2 text-right text-slate-400 tabular-nums">
+                              {fmt(pctExit, "percent")}
+                            </td>
+                            <td className="py-2 text-right text-slate-400 tabular-nums">
+                              {isFiniteNum(ac) ? fmt(ac, "currency", currency) : "—"}
+                            </td>
+                            <td className={`py-2 text-right font-medium ${actionColor}`}>
+                              {action}
+                              {isFiniteNum(acDiff) && Math.abs(acDiff) > 1 && inv.participation === "None" && (
+                                <span className="block text-[10px] text-slate-500">
+                                  {acDiff > 0 ? "+" : ""}{fmt(acDiff, "currency", currency)}
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                      {r.csParsed.map((cs) => {
+                        const amt = r.csAmt[cs.id] ?? 0;
+                        const pctExit = r.exit > 0 ? (amt / r.exit) * 100 : null;
+                        return (
+                          <tr key={cs.id} className="border-b border-slate-800/40 hover:bg-slate-800/20 opacity-75">
+                            <td className="py-2 text-slate-400 truncate max-w-[72px] pr-2">
+                              {cs.name || "(common)"}
+                            </td>
+                            <td className="py-2 text-right text-slate-600">—</td>
+                            <td className="py-2 text-right text-slate-600">—</td>
+                            <td className="py-2 text-right text-slate-300 font-semibold tabular-nums">
+                              {fmt(amt, "currency", currency)}
+                            </td>
+                            <td className="py-2 text-right text-slate-500 tabular-nums">
+                              {fmt(pctExit, "percent")}
+                            </td>
+                            <td className="py-2 text-right text-slate-600">—</td>
+                            <td className="py-2 text-right text-slate-600">—</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* ── Full-width stacked bar chart ── */}
+        {r && !r.noInvestors && chartParties && chartParties.length > 0 && stackedBarData && (
+          <div className="mt-8 bg-slate-800/30 rounded-xl p-4 border border-slate-700/30">
+            <p className="text-xs font-medium text-slate-500 uppercase tracking-wider mb-1">
+              Exit Proceeds Distribution
+            </p>
+            <p className="text-xs text-slate-600 mb-4">
+              How {fmt(r.exit, "currency", currency)} is divided across all stakeholders
+            </p>
+            <div className="h-20">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart layout="vertical" data={stackedBarData} margin={{ top: 0, right: 8, left: 0, bottom: 0 }}>
+                  <XAxis
+                    type="number"
+                    tickFormatter={(v) => {
+                      if (Math.abs(v) >= 1e6) return `${currSymbol}${(v / 1e6).toFixed(0)}M`;
+                      if (Math.abs(v) >= 1e3) return `${currSymbol}${(v / 1e3).toFixed(0)}k`;
+                      return `${currSymbol}${v}`;
+                    }}
+                    tick={{ fill: "#64748b", fontSize: 9 }}
+                    axisLine={false}
+                    tickLine={false}
+                  />
+                  <YAxis
+                    type="category"
+                    dataKey="name"
+                    tick={{ fill: "#64748b", fontSize: 9 }}
+                    axisLine={false}
+                    tickLine={false}
+                    width={32}
+                  />
+                  <Tooltip
+                    formatter={(val, name) => {
+                      const i = parseInt(name.replace("p", ""), 10);
+                      return [fmt(val, "currency", currency), chartParties[i]?.name || name];
+                    }}
+                    contentStyle={{ background: "#1e293b", border: "1px solid #334155", borderRadius: "8px", fontSize: "11px", color: "#cbd5e1" }}
+                  />
+                  {chartParties.map((party, i) => (
+                    <Bar
+                      key={i}
+                      dataKey={`p${i}`}
+                      stackId="s"
+                      fill={party.color}
+                      fillOpacity={0.9}
+                      radius={
+                        i === 0 ? [4, 0, 0, 4]
+                          : i === chartParties.length - 1 ? [0, 4, 4, 0]
+                          : [0, 0, 0, 0]
+                      }
+                    />
+                  ))}
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            <div className="flex flex-wrap gap-x-4 gap-y-1.5 mt-3">
+              {chartParties.map((p) => (
+                <div key={p.name} className="flex items-center gap-1.5">
+                  <div className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: p.color }} />
+                  <span className="text-xs text-slate-400">{p.name}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </CalcCard>
+    </>
+  );
+}
+
+// ─── Calculator 7 — Runway & Burn Rate ───────────────────────────────────────
+
+const RUNWAY_DEFAULTS = {
+  cashBalance: "",
+  grossBurn: "",
+  monthlyRevenue: "0",
+  revenueGrowth: "",
+  burnGrowth: "",
+  targetReserve: "",
+};
+
+function simulateRunway(params) {
+  const { cashBalance, grossBurn, monthlyRevenue = 0, revenueGrowth = 0, burnGrowth = 0, targetReserve = 0 } = params;
+  if (!isFiniteNum(cashBalance) || cashBalance <= 0) return null;
+  if (!isFiniteNum(grossBurn) || grossBurn <= 0) return null;
+
+  const rev0 = isFiniteNum(monthlyRevenue) ? Math.max(0, monthlyRevenue) : 0;
+  const revGr = isFiniteNum(revenueGrowth) ? revenueGrowth / 100 : 0;
+  const burnGr = isFiniteNum(burnGrowth) ? burnGrowth / 100 : 0;
+  const reserve = isFiniteNum(targetReserve) ? Math.max(0, targetReserve) : 0;
+  const isPositive = grossBurn <= rev0;
+
+  const MAX = 60;
+  const monthlyData = [];
+  let cash = cashBalance;
+  let rev = rev0;
+  let burn = grossBurn;
+  let runwayMonth = null;
+  let cashOutMonth = null;
+  let breakevenMonth = null;
+
+  monthlyData.push({ month: 0, cash, rev, burn, net: burn - rev });
+
+  for (let m = 1; m <= MAX; m++) {
+    rev = rev * (1 + revGr);
+    burn = burn * (1 + burnGr);
+    const netBurn = burn - rev;
+    cash = Math.max(0, cash - netBurn);
+    monthlyData.push({ month: m, cash, rev, burn, net: netBurn });
+
+    if (runwayMonth === null && cash <= reserve) runwayMonth = m;
+    if (cashOutMonth === null && cash <= 0) cashOutMonth = m;
+    if (breakevenMonth === null && rev >= burn) breakevenMonth = m;
+    if (cashOutMonth !== null) break;
+  }
+
+  const finalCash = monthlyData[monthlyData.length - 1].cash;
+
+  return {
+    monthlyData,
+    runwayMonth: runwayMonth ?? (finalCash > reserve ? ">60" : null),
+    cashOutMonth: cashOutMonth ?? (finalCash > 0 ? ">60" : null),
+    breakevenMonth,
+    initialNetBurn: grossBurn - rev0,
+    isPositive,
+  };
+}
+
+function RunwayCalculator({ currency }) {
+  const [inputs, setInputs] = useState(RUNWAY_DEFAULTS);
+  const [copyFn, CopyModalNode] = useCopyToClipboard();
+  const setField = useCallback(
+    (field) => (val) => setInputs((prev) => ({ ...prev, [field]: val })), []
+  );
+
+  const parsed = useMemo(() => ({
+    cashBalance: parseVal(inputs.cashBalance),
+    grossBurn: parseVal(inputs.grossBurn),
+    monthlyRevenue: parseVal(inputs.monthlyRevenue) ?? 0,
+    revenueGrowth: parseVal(inputs.revenueGrowth) ?? 0,
+    burnGrowth: parseVal(inputs.burnGrowth) ?? 0,
+    targetReserve: parseVal(inputs.targetReserve) ?? 0,
+  }), [inputs]);
+
+  const netBurn = useMemo(() => (
+    isFiniteNum(parsed.grossBurn) && isFiniteNum(parsed.monthlyRevenue)
+      ? parsed.grossBurn - parsed.monthlyRevenue
+      : null
+  ), [parsed.grossBurn, parsed.monthlyRevenue]);
+
+  const r = useMemo(() => { try { return simulateRunway(parsed); } catch { return null; } }, [parsed]);
+
+  const scenarios = useMemo(() => {
+    if (!isFiniteNum(parsed.cashBalance) || !isFiniteNum(parsed.grossBurn)) return null;
+    return [
+      { label: "Current Trajectory", color: "#0ea5e9", result: simulateRunway(parsed) },
+      { label: "−20% Burn", color: "#22c55e", result: simulateRunway({ ...parsed, grossBurn: parsed.grossBurn * 0.8 }) },
+      { label: "+20% Revenue", color: "#8b5cf6", result: simulateRunway({ ...parsed, monthlyRevenue: parsed.monthlyRevenue * 1.2 }) },
+    ];
+  }, [parsed]);
+
+  const cashOutDate = useMemo(() => {
+    if (!r || typeof r.runwayMonth !== "number") return null;
+    const d = new Date();
+    d.setMonth(d.getMonth() + r.runwayMonth);
+    return d.toLocaleDateString("en-US", { month: "short", year: "numeric" });
+  }, [r]);
+
+  const handleReset = useCallback(() => setInputs(RUNWAY_DEFAULTS), []);
+  const handleCopy = useCallback(() => {
+    const lines = [
+      "Runway & Burn Rate Calculator",
+      "==============================",
+      `Cash Balance:      ${fmt(parsed.cashBalance, "currency", currency)}`,
+      `Gross Burn/mo:     ${fmt(parsed.grossBurn, "currency", currency)}`,
+      `Monthly Revenue:   ${fmt(parsed.monthlyRevenue, "currency", currency)}`,
+      `Net Burn/mo:       ${fmt(netBurn, "currency", currency)}`,
+      `Target Reserve:    ${fmt(parsed.targetReserve, "currency", currency)}`,
+      "",
+      `Runway:            ${r?.runwayMonth ?? "—"} months`,
+      `Estimated Cash-Out: ${cashOutDate ?? "—"}`,
+      `Breakeven Month:   ${r?.breakevenMonth ? `Month ${r.breakevenMonth}` : "—"}`,
+    ];
+    copyFn(lines.join("\n"));
+  }, [parsed, netBurn, r, cashOutDate, currency, copyFn]);
+
+  const currSymbol = CURRENCY_META[currency]?.symbol || "$";
+  const targetReserve = parsed.targetReserve;
+
+  const fmtRunway = (res) => {
+    if (!res) return "—";
+    if (res.isPositive) return "∞";
+    const m = res.runwayMonth;
+    return typeof m === "number" ? String(m) : m === ">60" ? ">60" : "—";
+  };
+
+  return (
+    <>
+      {CopyModalNode}
+      <CalcCard
+        title="Runway & Burn Rate Calculator"
+        description="Know exactly how long your cash will last and what changes to burn rate or revenue growth would buy you more time."
+        onReset={handleReset}
+        onCopy={handleCopy}
+      >
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+          {/* Inputs */}
+          <div>
+            <SectionHeader>Inputs</SectionHeader>
+            {!isFiniteNum(parsed.cashBalance) && (
+              <InfoBanner variant="slate">
+                Enter your current cash balance to calculate runway.
+              </InfoBanner>
+            )}
+            {r?.isPositive && isFiniteNum(parsed.cashBalance) && (
+              <InfoBanner variant="green">
+                Your business is cash flow positive — net burn is negative. Revenue exceeds gross burn; your cash position is growing.
+              </InfoBanner>
+            )}
+            <InputField
+              label="Current Cash Balance"
+              value={inputs.cashBalance}
+              onChange={setField("cashBalance")}
+              placeholder="e.g. 3000000"
+              prefix={currSymbol}
+              tooltip="Total cash and cash equivalents on hand today. This is your starting point for the runway calculation."
+            />
+            <InputField
+              label="Monthly Gross Burn"
+              value={inputs.grossBurn}
+              onChange={setField("grossBurn")}
+              placeholder="e.g. 250000"
+              prefix={currSymbol}
+              tooltip="Total monthly operating spend before revenue — salaries, rent, software, and all outflows. Typical early-stage startups: $100k–$500k/mo."
+            />
+            <InputField
+              label="Monthly Revenue"
+              value={inputs.monthlyRevenue}
+              onChange={setField("monthlyRevenue")}
+              placeholder="0"
+              prefix={currSymbol}
+              tooltip="Current monthly revenue (MRR or equivalent). Reduces your effective burn. Default 0 if pre-revenue."
+            />
+            {/* Net burn — read-only derived field */}
+            <div className="mb-3">
+              <label className="block text-xs font-medium text-slate-400 mb-1">
+                Monthly Net Burn <span className="text-slate-600 font-normal">(auto-calculated)</span>
+              </label>
+              <div className="w-full bg-slate-900/40 border border-slate-700/50 rounded-lg px-3 py-2 text-sm tabular-nums text-slate-400 select-none">
+                {isFiniteNum(netBurn)
+                  ? `${netBurn <= 0 ? "+" : ""}${fmtCurrency(Math.abs(netBurn), currency)}/mo${netBurn <= 0 ? " (cash-flow positive)" : ""}`
+                  : "—"}
+              </div>
+            </div>
+            <InputField
+              label="Monthly Revenue Growth Rate"
+              value={inputs.revenueGrowth}
+              onChange={setField("revenueGrowth")}
+              placeholder="e.g. 5 (blank = flat)"
+              suffix="% MoM"
+              tooltip="Expected month-over-month revenue growth. Leave blank for flat. 5% MoM roughly doubles revenue every 15 months."
+            />
+            <InputField
+              label="Monthly Burn Growth Rate"
+              value={inputs.burnGrowth}
+              onChange={setField("burnGrowth")}
+              placeholder="e.g. 2 (blank = flat)"
+              suffix="% MoM"
+              tooltip="Expected month-over-month increase in gross burn from planned hires or expansion. Leave blank if burn is flat."
+            />
+            <InputField
+              label="Target Cash Reserve at End"
+              value={inputs.targetReserve}
+              onChange={setField("targetReserve")}
+              placeholder="0"
+              prefix={currSymbol}
+              tooltip="Minimum cash buffer you want to maintain — e.g. 3 months of expenses. Runway is calculated to this threshold, not to zero."
+            />
+          </div>
+
+          {/* Results */}
+          <div>
+            <SectionHeader>Outputs</SectionHeader>
+            <div className="bg-slate-800/40 rounded-xl p-4 border border-slate-700/30 mb-4">
+              <ResultRow
+                label="Runway"
+                value={
+                  r
+                    ? r.isPositive
+                      ? "Cash-flow positive"
+                      : typeof r.runwayMonth === "number"
+                        ? `${r.runwayMonth} months`
+                        : r.runwayMonth === ">60"
+                          ? ">60 months"
+                          : "—"
+                    : "—"
+                }
+                highlight={!!r}
+                note={r?.runwayMonth === ">60" ? "Simulation capped at 60 months — runway exceeds this horizon." : undefined}
+              />
+              <ResultRow
+                label="Estimated Cash-Out Date"
+                value={cashOutDate ?? (r?.isPositive ? "N/A — profitable" : "—")}
+              />
+              <ResultRow
+                label="Net Burn Rate"
+                value={isFiniteNum(netBurn) ? `${fmtCurrency(netBurn, currency)}/mo` : "—"}
+                redValue={isFiniteNum(netBurn) && netBurn > 0}
+              />
+              <ResultRow
+                label="Gross Burn Rate"
+                value={isFiniteNum(parsed.grossBurn) ? `${fmtCurrency(parsed.grossBurn, currency)}/mo` : "—"}
+              />
+              <ResultRow
+                label="Monthly Revenue"
+                value={isFiniteNum(parsed.monthlyRevenue) ? `${fmtCurrency(parsed.monthlyRevenue, currency)}/mo` : "—"}
+              />
+              <ResultRow
+                label="Months to Breakeven"
+                value={
+                  r?.isPositive
+                    ? "Already profitable"
+                    : r?.breakevenMonth
+                      ? `Month ${r.breakevenMonth}`
+                      : "—"
+                }
+                note={!r?.breakevenMonth && !r?.isPositive ? "Enter a Revenue Growth Rate to model path to breakeven." : undefined}
+              />
+            </div>
+
+            {/* Three scenario cards */}
+            {scenarios && (
+              <div className="mb-4">
+                <p className="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-3">
+                  Scenario Comparison
+                </p>
+                <div className="grid grid-cols-3 gap-3">
+                  {scenarios.map((sc) => (
+                    <div key={sc.label} className="bg-slate-800/50 border border-slate-700/30 rounded-xl p-3 text-center">
+                      <div className="text-3xl font-black tabular-nums leading-none" style={{ color: sc.color }}>
+                        {fmtRunway(sc.result)}
+                      </div>
+                      <div className="text-xs text-slate-500 mt-1">months</div>
+                      <div className="text-xs text-slate-400 mt-1.5 font-medium leading-tight">{sc.label}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* ── Cash balance area chart ── */}
+        {r?.monthlyData && r.monthlyData.length > 1 && (
+          <div className="mt-8 bg-slate-800/30 rounded-xl p-4 border border-slate-700/30">
+            <p className="text-xs font-medium text-slate-500 uppercase tracking-wider mb-1">
+              Cash Balance Over Time
+            </p>
+            <p className="text-xs text-slate-600 mb-4">Month on X-axis · Cash remaining on Y-axis</p>
+            <div className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={r.monthlyData} margin={{ top: 8, right: 24, left: 0, bottom: 4 }}>
+                  <defs>
+                    <linearGradient id="cashAreaGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#0ea5e9" stopOpacity={0.25} />
+                      <stop offset="95%" stopColor="#0ea5e9" stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <XAxis
+                    dataKey="month"
+                    tick={{ fill: "#64748b", fontSize: 10 }}
+                    axisLine={false}
+                    tickLine={false}
+                    label={{ value: "Month", position: "insideBottomRight", offset: -4, fill: "#64748b", fontSize: 10 }}
+                  />
+                  <YAxis
+                    tickFormatter={(v) => {
+                      if (Math.abs(v) >= 1e6) return `${currSymbol}${(v / 1e6).toFixed(1)}M`;
+                      if (Math.abs(v) >= 1e3) return `${currSymbol}${(v / 1e3).toFixed(0)}k`;
+                      return `${currSymbol}${v}`;
+                    }}
+                    tick={{ fill: "#64748b", fontSize: 10 }}
+                    axisLine={false}
+                    tickLine={false}
+                    width={56}
+                    label={{ value: "Cash", angle: -90, position: "insideLeft", fill: "#64748b", fontSize: 10 }}
+                  />
+                  <Tooltip
+                    formatter={(val) => [fmt(val, "currency", currency), "Cash Balance"]}
+                    labelFormatter={(v) => `Month ${v}`}
+                    contentStyle={{ background: "#1e293b", border: "1px solid #334155", borderRadius: "8px", fontSize: "11px", color: "#cbd5e1" }}
+                  />
+                  {isFiniteNum(targetReserve) && targetReserve > 0 && (
+                    <ReferenceLine
+                      y={targetReserve}
+                      stroke="#ef4444"
+                      strokeDasharray="5 4"
+                      label={{ value: "Reserve", position: "insideTopRight", fill: "#ef4444", fontSize: 9 }}
+                    />
+                  )}
+                  {typeof r.runwayMonth === "number" && (
+                    <ReferenceLine
+                      x={r.runwayMonth}
+                      stroke="#f59e0b"
+                      strokeDasharray="4 3"
+                      label={{ value: "Cash out", position: "insideTopLeft", fill: "#f59e0b", fontSize: 9 }}
+                    />
+                  )}
+                  <Area
+                    type="monotone"
+                    dataKey="cash"
+                    stroke="#0ea5e9"
+                    strokeWidth={2.5}
+                    fill="url(#cashAreaGrad)"
+                    dot={false}
+                    activeDot={{ r: 4, fill: "#0ea5e9", strokeWidth: 0 }}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        )}
+      </CalcCard>
+    </>
+  );
+}
+
+// ─── Calculator 8 — Unit Economics / LTV:CAC ─────────────────────────────────
+
+const UE_DEFAULTS = {
+  arpu: "",
+  grossMarginPct: "70",
+  churnMode: "monthly",
+  monthlyChurn: "",
+  annualChurn: "",
+  cac: "",
+  salesCycle: "",
+  paybackTarget: "",
+};
+
+function UECalculator({ currency }) {
+  const [inputs, setInputs] = useState(UE_DEFAULTS);
+  const [copyFn, CopyModalNode] = useCopyToClipboard();
+  const setField = useCallback(
+    (field) => (val) => setInputs((prev) => ({ ...prev, [field]: val })), []
+  );
+
+  const toggleChurnMode = useCallback(() => {
+    setInputs((prev) => ({
+      ...prev,
+      churnMode: prev.churnMode === "monthly" ? "annual" : "monthly",
+      monthlyChurn: "",
+      annualChurn: "",
+    }));
+  }, []);
+
+  const r = useMemo(() => {
+    try {
+      const arpu = parseVal(inputs.arpu);
+      const gm = parseVal(inputs.grossMarginPct) ?? 70;
+      const cac = parseVal(inputs.cac);
+      const salesCycle = parseVal(inputs.salesCycle);
+      const paybackTarget = parseVal(inputs.paybackTarget);
+
+      let monthlyChurnDec = null;
+      let annualChurnPct = null;
+      let zeroChurnWarn = false;
+
+      if (inputs.churnMode === "monthly") {
+        const raw = parseVal(inputs.monthlyChurn);
+        if (isFiniteNum(raw)) {
+          if (raw === 0) { zeroChurnWarn = true; }
+          monthlyChurnDec = clamp(Math.max(0, raw), 0, 100) / 100;
+          if (monthlyChurnDec < 1e-6) monthlyChurnDec = 1e-6;
+          annualChurnPct = (1 - Math.pow(1 - monthlyChurnDec, 12)) * 100;
+        }
+      } else {
+        const raw = parseVal(inputs.annualChurn);
+        if (isFiniteNum(raw)) {
+          if (raw === 0) { zeroChurnWarn = true; }
+          const ac = clamp(Math.max(0, raw), 0, 100) / 100;
+          monthlyChurnDec = Math.max(1e-6, 1 - Math.pow(1 - ac, 1 / 12));
+          annualChurnPct = raw;
+        }
+      }
+
+      const monthlyGP = isFiniteNum(arpu) && isFiniteNum(gm) ? arpu * (gm / 100) : null;
+      const lifetime = isFiniteNum(monthlyChurnDec) ? 1 / monthlyChurnDec : null;
+      const ltv = isFiniteNum(monthlyGP) && isFiniteNum(lifetime) ? monthlyGP * lifetime : null;
+      const ltvCac = isFiniteNum(ltv) && isFiniteNum(cac) && cac > 0 ? ltv / cac : null;
+      const cacPayback = isFiniteNum(cac) && isFiniteNum(monthlyGP) && monthlyGP > 0
+        ? cac / monthlyGP : null;
+      const paybackDiff = isFiniteNum(cacPayback) && isFiniteNum(paybackTarget)
+        ? paybackTarget - cacPayback : null;
+
+      let badge = null;
+      if (isFiniteNum(ltvCac)) {
+        if (ltvCac < 1) badge = { label: "Unsustainable", text: "text-red-400", bg: "bg-red-950/30 border-red-700/40" };
+        else if (ltvCac < 3) badge = { label: "Marginal", text: "text-yellow-400", bg: "bg-yellow-950/30 border-yellow-700/40" };
+        else if (ltvCac <= 5) badge = { label: "Healthy (VC fundable)", text: "text-green-400", bg: "bg-green-950/30 border-green-700/40" };
+        else badge = { label: "Exceptional", text: "text-cyan-400", bg: "bg-cyan-950/30 border-cyan-700/40" };
+      }
+
+      return {
+        arpu, gm, cac, salesCycle, paybackTarget,
+        monthlyChurnDec, annualChurnPct, zeroChurnWarn,
+        monthlyGP, lifetime, lifetimeYears: isFiniteNum(lifetime) ? lifetime / 12 : null,
+        ltv, ltvCac, cacPayback, paybackDiff, badge,
+      };
+    } catch { return {}; }
+  }, [inputs]);
+
+  const handleReset = useCallback(() => setInputs(UE_DEFAULTS), []);
+  const handleCopy = useCallback(() => {
+    const lines = [
+      "Unit Economics (LTV:CAC) Calculator",
+      "=====================================",
+      `ARPU/mo:              ${fmt(r.arpu, "currency", currency)}`,
+      `Gross Margin:         ${fmt(r.gm, "percent")}`,
+      `Monthly Churn:        ${isFiniteNum(r.monthlyChurnDec) ? fmt(r.monthlyChurnDec * 100, "percent") : "—"}`,
+      `Annual Churn:         ${fmt(r.annualChurnPct, "percent")}`,
+      `Avg Lifetime:         ${isFiniteNum(r.lifetime) ? r.lifetime.toFixed(1) + " months" : "—"}`,
+      `Monthly GP/Customer:  ${fmt(r.monthlyGP, "currency", currency)}`,
+      `LTV:                  ${fmt(r.ltv, "currency", currency)}`,
+      `CAC:                  ${fmt(r.cac, "currency", currency)}`,
+      `LTV:CAC:              ${isFiniteNum(r.ltvCac) ? r.ltvCac.toFixed(2) + "x" : "—"}${r.badge ? ` (${r.badge.label})` : ""}`,
+      `CAC Payback:          ${isFiniteNum(r.cacPayback) ? r.cacPayback.toFixed(1) + " months" : "—"}`,
+    ];
+    copyFn(lines.join("\n"));
+  }, [r, currency, copyFn]);
+
+  const currSymbol = CURRENCY_META[currency]?.symbol || "$";
+
+  return (
+    <>
+      {CopyModalNode}
+      <CalcCard
+        title="Unit Economics Calculator (LTV:CAC)"
+        description="Measure the health of your business model. Understand whether you're building a sustainable, fundable company or burning cash on unprofitable growth."
+        onReset={handleReset}
+        onCopy={handleCopy}
+      >
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+          {/* Inputs */}
+          <div>
+            <SectionHeader>Inputs</SectionHeader>
+            <InputField
+              label="Avg. Revenue Per Customer / Month (ARPU)"
+              value={inputs.arpu}
+              onChange={setField("arpu")}
+              placeholder="e.g. 150"
+              prefix={currSymbol}
+              tooltip="Average monthly revenue per active customer. For annual contracts divide ARR by 12. Typical SaaS ARPU ranges from $50 (SMB) to $5,000+ (enterprise)."
+            />
+            <InputField
+              label="Gross Margin %"
+              value={inputs.grossMarginPct}
+              onChange={setField("grossMarginPct")}
+              placeholder="70"
+              suffix="%"
+              tooltip="Revenue remaining after direct cost of goods sold. SaaS companies typically 60–85%. Used to convert revenue to gross profit when calculating LTV."
+            />
+
+            {/* Churn toggle */}
+            <div className="mb-3">
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-xs font-medium text-slate-400">
+                  Churn Rate
+                  <FieldTooltip text="Percentage of customers lost per period. Monthly churn of 2% ≈ 22% annual. Best-in-class SaaS targets sub-1% monthly churn." />
+                </label>
+                <button
+                  onClick={toggleChurnMode}
+                  className="text-xs text-cyan-400 hover:text-cyan-300 transition-colors border border-cyan-700/30 hover:border-cyan-500/30 px-2 py-0.5 rounded"
+                >
+                  Switch to {inputs.churnMode === "monthly" ? "Annual" : "Monthly"}
+                </button>
+              </div>
+              <div className="relative">
+                <input
+                  type="number"
+                  value={inputs.churnMode === "monthly" ? inputs.monthlyChurn : inputs.annualChurn}
+                  onChange={(e) => setField(inputs.churnMode === "monthly" ? "monthlyChurn" : "annualChurn")(e.target.value)}
+                  placeholder={inputs.churnMode === "monthly" ? "e.g. 2" : "e.g. 20"}
+                  className="w-full bg-slate-800/80 border border-slate-600/70 rounded-lg px-3 pr-24 py-2 text-white text-sm placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors appearance-none"
+                />
+                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 text-xs pointer-events-none">
+                  % {inputs.churnMode}
+                </span>
+              </div>
+              {/* Derived churn display */}
+              {isFiniteNum(r.monthlyChurnDec) && (
+                <p className="text-xs text-slate-500 mt-1 italic">
+                  {inputs.churnMode === "monthly"
+                    ? `≈ ${isFiniteNum(r.annualChurnPct) ? r.annualChurnPct.toFixed(1) : "—"}% annual churn`
+                    : `≈ ${isFiniteNum(r.monthlyChurnDec) ? (r.monthlyChurnDec * 100).toFixed(2) : "—"}% monthly churn`}
+                </p>
+              )}
+              {r.zeroChurnWarn && (
+                <p className="text-xs text-yellow-400 mt-1">
+                  0% churn produces infinite LTV. Verify your churn input.
+                </p>
+              )}
+            </div>
+
+            <InputField
+              label="Customer Acquisition Cost (CAC)"
+              value={inputs.cac}
+              onChange={setField("cac")}
+              placeholder="e.g. 1200"
+              prefix={currSymbol}
+              tooltip="Total cost to acquire one customer — marketing spend + sales salaries + commissions, divided by number of new customers in a period."
+            />
+            <InputField
+              label="Average Sales Cycle"
+              value={inputs.salesCycle}
+              onChange={setField("salesCycle")}
+              placeholder="e.g. 3"
+              suffix="months"
+              tooltip="Time from first contact to closed deal. Longer cycles increase the effective cost of customer acquisition and delay cash recovery."
+            />
+            <InputField
+              label="Target Payback Period"
+              value={inputs.paybackTarget}
+              onChange={setField("paybackTarget")}
+              placeholder="e.g. 12"
+              suffix="months"
+              tooltip="Your desired CAC payback benchmark. 12 months is excellent for SaaS; above 24 months signals a capital-efficiency concern."
+            />
+          </div>
+
+          {/* Results */}
+          <div>
+            <SectionHeader>Results</SectionHeader>
+
+            {/* LTV:CAC badge */}
+            {r.badge && (
+              <div className={`border rounded-xl px-4 py-3 mb-4 flex items-center justify-between ${r.badge.bg}`}>
+                <div>
+                  <p className={`text-xs font-semibold uppercase tracking-wider mb-0.5 ${r.badge.text}`}>
+                    {r.badge.label}
+                  </p>
+                  <p className="text-xs text-slate-500">LTV:CAC benchmark rating</p>
+                </div>
+                <p className={`text-3xl font-black tabular-nums ${r.badge.text}`}>
+                  {isFiniteNum(r.ltvCac) ? `${r.ltvCac.toFixed(1)}x` : "—"}
+                </p>
+              </div>
+            )}
+
+            <div className="bg-slate-800/40 rounded-xl p-4 border border-slate-700/30 mb-4">
+              <ResultRow
+                label="LTV"
+                value={fmt(r.ltv, "currency", currency)}
+                highlight={isFiniteNum(r.ltv)}
+                note={!isFiniteNum(r.ltv) ? "Enter ARPU, Gross Margin %, and Churn Rate." : undefined}
+              />
+              <ResultRow
+                label="CAC"
+                value={fmt(r.cac, "currency", currency)}
+                note={!isFiniteNum(r.cac) ? "Enter Customer Acquisition Cost." : undefined}
+              />
+              <ResultRow
+                label="LTV:CAC Ratio"
+                value={isFiniteNum(r.ltvCac) ? `${r.ltvCac.toFixed(2)}x` : "—"}
+                redValue={isFiniteNum(r.ltvCac) && r.ltvCac < 1}
+              />
+              <ResultRow
+                label="Monthly Gross Profit / Customer"
+                value={fmt(r.monthlyGP, "currency", currency)}
+              />
+              <ResultRow
+                label="Avg. Customer Lifetime"
+                value={
+                  isFiniteNum(r.lifetime)
+                    ? `${r.lifetime.toFixed(1)} mo (${r.lifetimeYears?.toFixed(1)} yrs)`
+                    : "—"
+                }
+              />
+              <ResultRow
+                label="CAC Payback Period"
+                value={isFiniteNum(r.cacPayback) ? `${r.cacPayback.toFixed(1)} months` : "—"}
+                redValue={isFiniteNum(r.cacPayback) && isFiniteNum(r.paybackTarget) && r.cacPayback > r.paybackTarget}
+              />
+            </div>
+
+            {/* Payback vs target bar */}
+            {isFiniteNum(r.cacPayback) && isFiniteNum(r.paybackTarget) && (
+              <div className="bg-slate-800/30 rounded-xl p-4 border border-slate-700/30 mb-4">
+                <p className="text-xs font-medium text-slate-500 uppercase tracking-wider mb-3">
+                  Payback Period vs. Target
+                </p>
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs text-slate-400">CAC Payback</span>
+                  <span className="text-xs font-semibold text-white tabular-nums">{r.cacPayback.toFixed(1)} mo</span>
+                </div>
+                <div className="relative h-4 bg-slate-800 rounded-full overflow-hidden mb-2">
+                  {(() => {
+                    const scale = Math.max(r.paybackTarget * 1.5, r.cacPayback * 1.1);
+                    const actualPct = Math.min(100, (r.cacPayback / scale) * 100);
+                    const targetPct = Math.min(100, (r.paybackTarget / scale) * 100);
+                    return (
+                      <>
+                        <div
+                          className="h-full rounded-full transition-all duration-500"
+                          style={{ width: `${actualPct}%`, background: r.cacPayback <= r.paybackTarget ? "#22c55e" : "#ef4444" }}
+                        />
+                        <div
+                          className="absolute top-0 h-full w-0.5 bg-white/50"
+                          style={{ left: `${targetPct}%` }}
+                        />
+                      </>
+                    );
+                  })()}
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-2 h-2 rounded-sm bg-white/50" />
+                    <span className="text-xs text-slate-500">Target: {r.paybackTarget.toFixed(0)} mo</span>
+                  </div>
+                  <span className={`text-xs font-semibold ${r.paybackDiff >= 0 ? "text-green-400" : "text-red-400"}`}>
+                    {r.paybackDiff >= 0
+                      ? `${r.paybackDiff.toFixed(1)} mo under target`
+                      : `${Math.abs(r.paybackDiff).toFixed(1)} mo over target`}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* Benchmark guide */}
+            <div className="bg-slate-800/20 rounded-xl p-4 border border-slate-700/20">
+              <p className="text-xs font-medium text-slate-500 uppercase tracking-wider mb-3">
+                LTV:CAC Benchmarks
+              </p>
+              <div className="space-y-2">
+                {[
+                  { range: "Below 1×", label: "Unsustainable", color: "#ef4444" },
+                  { range: "1× – 2×", label: "Marginal", color: "#f59e0b" },
+                  { range: "3× – 5×", label: "Healthy (VC fundable)", color: "#22c55e" },
+                  { range: "Above 5×", label: "Exceptional", color: "#06b6d4" },
+                ].map((b) => (
+                  <div key={b.label} className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <div className="w-2 h-2 rounded-sm" style={{ background: b.color }} />
+                      <span className="text-xs text-slate-400">{b.range}</span>
+                    </div>
+                    <span className="text-xs font-medium" style={{ color: b.color }}>{b.label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </CalcCard>
+    </>
+  );
+}
+
+// ─── Calculator Registry ──────────────────────────────────────────────────────
+
 const CALCULATORS = [
   {
     id: "safe-note",
@@ -3702,13 +5068,28 @@ const CALCULATORS = [
   },
   {
     id: "irr-moic",
-    label: "IRR / MOIC",
+    label: "IRR / XIRR",
     Component: IRRCalculator,
   },
   {
     id: "vc-simulator",
-    label: "VC Simulator",
+    label: "Fund Returns",
     Component: VCSimulator,
+  },
+  {
+    id: "waterfall",
+    label: "Waterfall",
+    Component: WaterfallCalculator,
+  },
+  {
+    id: "runway",
+    label: "Runway",
+    Component: RunwayCalculator,
+  },
+  {
+    id: "unit-economics",
+    label: "Unit Economics",
+    Component: UECalculator,
   },
 ];
 
