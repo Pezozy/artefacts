@@ -12,6 +12,10 @@ import {
   Legend,
   AreaChart,
   Area,
+  LineChart,
+  Line,
+  ComposedChart,
+  ReferenceLine,
 } from "recharts";
 
 // ─── Safe Math Utilities ───────────────────────────────────────────────────────
@@ -2254,6 +2258,1430 @@ function CapTableSimulator({ currency }) {
   );
 }
 
+// ─── Calculator 4 — IRR / MOIC with XIRR ─────────────────────────────────────
+
+const TODAY_STR = new Date().toISOString().split("T")[0];
+
+/** Newton-Raphson XIRR. Returns annualized rate or null on failure. */
+function computeXIRR(cashFlows) {
+  try {
+    if (!cashFlows || cashFlows.length < 2) return null;
+    const cfs = cashFlows
+      .map((cf) => ({ date: new Date(cf.date + "T00:00:00"), amount: cf.amount }))
+      .sort((a, b) => a.date - b.date);
+    const t0 = cfs[0].date.getTime();
+
+    const f = (r) =>
+      cfs.reduce((sum, cf) => {
+        const t = (cf.date.getTime() - t0) / (1000 * 60 * 60 * 24) / 365;
+        if (r <= -1) return NaN;
+        return sum + cf.amount / Math.pow(1 + r, t);
+      }, 0);
+
+    const df = (r) =>
+      cfs.reduce((sum, cf) => {
+        const t = (cf.date.getTime() - t0) / (1000 * 60 * 60 * 24) / 365;
+        if (r <= -1) return NaN;
+        return sum - (cf.amount * t) / Math.pow(1 + r, t + 1);
+      }, 0);
+
+    const converge = (guess) => {
+      let r = guess;
+      for (let i = 0; i < 1000; i++) {
+        const fr = f(r);
+        if (!isFinite(fr) || isNaN(fr)) return null;
+        if (Math.abs(fr) < 1e-7) return r;
+        const dfr = df(r);
+        if (!isFinite(dfr) || isNaN(dfr) || Math.abs(dfr) < 1e-14) return null;
+        const next = r - fr / dfr;
+        if (!isFinite(next) || isNaN(next)) return null;
+        r = next;
+      }
+      return Math.abs(f(r)) < 1e-7 ? r : null;
+    };
+
+    for (const g of [0.1, -0.5, 0.5, 2.0, -0.9]) {
+      const result = converge(g);
+      if (result !== null && isFinite(result) && !isNaN(result)) return result;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+const IRR_DEFAULTS = {
+  mode: "simple",
+  initialInvestment: "",
+  exitValue: "",
+  investmentDate: "",
+  exitDate: "",
+  cashFlows: [
+    { id: 1, date: TODAY_STR, amount: "", label: "Initial Investment" },
+    { id: 2, date: "", amount: "", label: "" },
+  ],
+};
+
+function IRRCalculator({ currency }) {
+  const [inputs, setInputs] = useState(IRR_DEFAULTS);
+  const [copyFn, CopyModalNode] = useCopyToClipboard();
+
+  const setField = useCallback(
+    (field) => (val) => setInputs((prev) => ({ ...prev, [field]: val })),
+    []
+  );
+
+  const addCashFlow = useCallback(() => {
+    setInputs((prev) => {
+      if (prev.cashFlows.length >= 50) return prev;
+      return {
+        ...prev,
+        cashFlows: [...prev.cashFlows, { id: Date.now(), date: "", amount: "", label: "" }],
+      };
+    });
+  }, []);
+
+  const removeCashFlow = useCallback((id) => {
+    setInputs((prev) => ({
+      ...prev,
+      cashFlows: prev.cashFlows.filter((cf) => cf.id !== id),
+    }));
+  }, []);
+
+  const updateCashFlow = useCallback((id, field, val) => {
+    setInputs((prev) => ({
+      ...prev,
+      cashFlows: prev.cashFlows.map((cf) =>
+        cf.id === id ? { ...cf, [field]: val } : cf
+      ),
+    }));
+  }, []);
+
+  const moveCashFlow = useCallback((id, dir) => {
+    setInputs((prev) => {
+      const arr = [...prev.cashFlows];
+      const idx = arr.findIndex((cf) => cf.id === id);
+      if (idx < 0) return prev;
+      const newIdx = idx + dir;
+      if (newIdx < 0 || newIdx >= arr.length) return prev;
+      [arr[idx], arr[newIdx]] = [arr[newIdx], arr[idx]];
+      return { ...prev, cashFlows: arr };
+    });
+  }, []);
+
+  // ── Simple mode ─────────────────────────────────────────────────────────
+  const simpleResults = useMemo(() => {
+    try {
+      const inv = parseVal(inputs.initialInvestment);
+      const exit = parseVal(inputs.exitValue);
+      const invDate = inputs.investmentDate
+        ? new Date(inputs.investmentDate + "T00:00:00")
+        : null;
+      const exitDate = inputs.exitDate
+        ? new Date(inputs.exitDate + "T00:00:00")
+        : null;
+
+      const moic =
+        isFiniteNum(inv) && inv > 0 && isFiniteNum(exit) ? exit / inv : null;
+
+      let holdingYears = null;
+      if (invDate && exitDate && exitDate > invDate) {
+        holdingYears =
+          (exitDate.getTime() - invDate.getTime()) / (1000 * 60 * 60 * 24) / 365.25;
+      }
+
+      let irr = null;
+      if (isFiniteNum(moic) && moic > 0 && isFiniteNum(holdingYears) && holdingYears > 0) {
+        irr = Math.pow(moic, 1 / holdingYears) - 1;
+      }
+
+      const cashOnCash =
+        isFiniteNum(inv) && inv > 0 && isFiniteNum(exit)
+          ? ((exit - inv) / inv) * 100
+          : null;
+      const totalProfit =
+        isFiniteNum(inv) && isFiniteNum(exit) ? exit - inv : null;
+
+      // Linear interpolation chart
+      let chartData = null;
+      if (
+        invDate &&
+        exitDate &&
+        exitDate > invDate &&
+        isFiniteNum(inv) &&
+        isFiniteNum(exit)
+      ) {
+        const N = 20;
+        const t0 = invDate.getTime();
+        const t1 = exitDate.getTime();
+        chartData = Array.from({ length: N + 1 }, (_, i) => {
+          const t = i / N;
+          const d = new Date(t0 + t * (t1 - t0));
+          return {
+            date: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`,
+            value: parseFloat((inv + t * (exit - inv)).toFixed(0)),
+          };
+        });
+      }
+
+      return { inv, exit, moic, holdingYears, irr, cashOnCash, totalProfit, chartData };
+    } catch {
+      return {};
+    }
+  }, [
+    inputs.initialInvestment,
+    inputs.exitValue,
+    inputs.investmentDate,
+    inputs.exitDate,
+  ]);
+
+  // ── XIRR mode ───────────────────────────────────────────────────────────
+  const xirrResults = useMemo(() => {
+    try {
+      const processedRows = inputs.cashFlows.map((cf) => {
+        const hasDate = cf.date && cf.date.trim() !== "";
+        const amount = parseVal(cf.amount);
+        const hasAmount = isFiniteNum(amount);
+        return { ...cf, amountNum: amount, hasDate, hasAmount, excluded: !hasDate || !hasAmount };
+      });
+
+      const validCFs = processedRows.filter((cf) => !cf.excluded);
+
+      // Merge same-date flows
+      const mergedMap = {};
+      validCFs.forEach((cf) => {
+        mergedMap[cf.date] = (mergedMap[cf.date] || 0) + cf.amountNum;
+      });
+      const mergedCFs = Object.entries(mergedMap).map(([date, amount]) => ({
+        date,
+        amount,
+      }));
+
+      if (validCFs.length < 2) {
+        return {
+          processedRows,
+          validationError:
+            "Add at least 2 cash flows with dates to calculate XIRR.",
+        };
+      }
+
+      const hasNeg = mergedCFs.some((cf) => cf.amount < 0);
+      const hasPos = mergedCFs.some((cf) => cf.amount > 0);
+
+      if (!hasNeg) {
+        return {
+          processedRows,
+          validationError:
+            "XIRR requires at least one negative cash flow (investment/outflow).",
+        };
+      }
+      if (!hasPos) {
+        return {
+          processedRows,
+          validationError:
+            "XIRR requires at least one positive cash flow (return/distribution).",
+        };
+      }
+
+      let xirrRate = null;
+      let xirrError = null;
+      try {
+        xirrRate = computeXIRR(mergedCFs);
+        if (xirrRate === null) {
+          xirrError =
+            "IRR could not be calculated for these cash flows. This can happen when all cash flows are the same sign (all inflows or all outflows), or when multiple IRR solutions exist. Please verify your cash flows include both negative (investment) and positive (return) entries.";
+        }
+      } catch {
+        xirrError = "IRR could not be calculated for these cash flows.";
+      }
+
+      const totalPositive = mergedCFs
+        .filter((cf) => cf.amount > 0)
+        .reduce((s, cf) => s + cf.amount, 0);
+      const totalNegative = Math.abs(
+        mergedCFs.filter((cf) => cf.amount < 0).reduce((s, cf) => s + cf.amount, 0)
+      );
+      const moic = totalNegative > 0 ? totalPositive / totalNegative : null;
+      const netCF = mergedCFs.reduce((s, cf) => s + cf.amount, 0);
+
+      const dateObjs = mergedCFs.map((cf) => new Date(cf.date + "T00:00:00"));
+      const minMs = Math.min(...dateObjs.map((d) => d.getTime()));
+      const maxMs = Math.max(...dateObjs.map((d) => d.getTime()));
+      const holdingYears = (maxMs - minMs) / (1000 * 60 * 60 * 24) / 365.25;
+
+      // Chart data: sorted cash flows + cumulative line
+      const sortedCFs = validCFs
+        .map((cf) => ({ date: cf.date, amount: cf.amountNum, label: cf.label }))
+        .sort((a, b) => new Date(a.date + "T00:00:00") - new Date(b.date + "T00:00:00"));
+
+      let cumulative = 0;
+      const chartData = sortedCFs.map((cf) => {
+        cumulative += cf.amount;
+        return {
+          date: cf.date,
+          amount: cf.amount,
+          cumulative,
+          isPositive: cf.amount >= 0,
+        };
+      });
+
+      return {
+        processedRows,
+        xirrRate,
+        xirrError,
+        moic,
+        totalPositive,
+        totalNegative,
+        netCF,
+        holdingYears: isFiniteNum(holdingYears) && holdingYears >= 0 ? holdingYears : null,
+        chartData,
+      };
+    } catch {
+      return { processedRows: inputs.cashFlows };
+    }
+  }, [inputs.cashFlows]);
+
+  const handleReset = useCallback(() => setInputs(IRR_DEFAULTS), []);
+
+  const handleCopy = useCallback(() => {
+    const mode = inputs.mode;
+    let text;
+    if (mode === "simple") {
+      const r = simpleResults;
+      text = [
+        "IRR / MOIC Calculator — Simple Mode",
+        "=====================================",
+        `Initial Investment:   ${fmtCurrency(r.inv, currency)}`,
+        `Exit Value:           ${fmtCurrency(r.exit, currency)}`,
+        `MOIC:                 ${isFiniteNum(r.moic) ? r.moic.toFixed(2) + "x" : "—"}`,
+        `IRR:                  ${isFiniteNum(r.irr) ? fmtPct(r.irr * 100) : "—"}`,
+        `Holding Period:       ${isFiniteNum(r.holdingYears) ? r.holdingYears.toFixed(1) + " years" : "—"}`,
+        `Cash-on-Cash Return:  ${fmtPct(r.cashOnCash)}`,
+        `Total Profit:         ${fmtCurrency(r.totalProfit, currency)}`,
+      ].join("\n");
+    } else {
+      const xr = xirrResults;
+      text = [
+        "IRR / MOIC Calculator — XIRR Mode",
+        "===================================",
+        `XIRR:                   ${isFiniteNum(xr?.xirrRate) ? fmtPct(xr.xirrRate * 100) : "—"}`,
+        `MOIC:                   ${isFiniteNum(xr?.moic) ? xr.moic.toFixed(2) + "x" : "—"}`,
+        `Total Capital Invested: ${fmtCurrency(xr?.totalNegative, currency)}`,
+        `Total Distributions:    ${fmtCurrency(xr?.totalPositive, currency)}`,
+        `Net Profit:             ${fmtCurrency(xr?.netCF, currency)}`,
+        `Holding Period:         ${isFiniteNum(xr?.holdingYears) ? xr.holdingYears.toFixed(1) + " years" : "—"}`,
+        "",
+        "Cash Flows:",
+        ...(xr?.processedRows || []).map(
+          (cf) =>
+            `  ${cf.date || "(no date)"} | ${
+              isFiniteNum(cf.amountNum) ? fmtCurrency(cf.amountNum, currency) : "(no amount)"
+            } | ${cf.label || ""}`
+        ),
+      ].join("\n");
+    }
+    copyFn(text);
+  }, [inputs.mode, simpleResults, xirrResults, currency, copyFn]);
+
+  const r = simpleResults;
+  const xr = xirrResults;
+  const currSymbol = CURRENCY_META[currency]?.symbol || "$";
+
+  return (
+    <>
+      {CopyModalNode}
+      <CalcCard
+        title="IRR / MOIC Calculator"
+        description="Calculate the true return on an investment including any interim cash flows — positive or negative — with exact dates, just like Excel's XIRR function."
+        onReset={handleReset}
+        onCopy={handleCopy}
+      >
+        {/* Mode toggle */}
+        <div className="flex gap-1 mb-6 bg-slate-800/40 rounded-xl p-1 w-fit border border-slate-700/30">
+          {[
+            ["simple", "Simple Mode"],
+            ["xirr", "XIRR Mode"],
+          ].map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setField("mode")(key)}
+              className={[
+                "px-5 py-1.5 rounded-lg text-sm font-medium transition-all",
+                inputs.mode === key
+                  ? "bg-cyan-600 text-white shadow-md shadow-cyan-900/30"
+                  : "text-slate-400 hover:text-slate-200",
+              ].join(" ")}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* ── SIMPLE MODE ── */}
+        {inputs.mode === "simple" && (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            <div>
+              <SectionHeader>Inputs</SectionHeader>
+              <InputField
+                label="Initial Investment"
+                value={inputs.initialInvestment}
+                onChange={setField("initialInvestment")}
+                placeholder="e.g. 500000"
+                prefix={currSymbol}
+                hint="Enter as a positive number — treated as outflow internally"
+              />
+              <InputField
+                label="Exit / Final Value"
+                value={inputs.exitValue}
+                onChange={setField("exitValue")}
+                placeholder="e.g. 2000000"
+                prefix={currSymbol}
+              />
+              <div className="mb-3">
+                <label className="block text-xs font-medium text-slate-400 mb-1">
+                  Investment Date
+                </label>
+                <input
+                  type="date"
+                  value={inputs.investmentDate}
+                  onChange={(e) => setField("investmentDate")(e.target.value)}
+                  className="w-full bg-slate-800/80 border border-slate-600/70 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/50 transition-colors"
+                />
+              </div>
+              <div className="mb-3">
+                <label className="block text-xs font-medium text-slate-400 mb-1">
+                  Exit Date
+                </label>
+                <input
+                  type="date"
+                  value={inputs.exitDate}
+                  onChange={(e) => setField("exitDate")(e.target.value)}
+                  className="w-full bg-slate-800/80 border border-slate-600/70 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/50 transition-colors"
+                />
+              </div>
+            </div>
+
+            <div>
+              <SectionHeader>Results</SectionHeader>
+              <div className="bg-slate-800/40 rounded-xl p-4 border border-slate-700/30 mb-4">
+                <ResultRow
+                  label="MOIC"
+                  value={isFiniteNum(r.moic) ? `${r.moic.toFixed(2)}x` : "—"}
+                  note={!isFiniteNum(r.moic) ? "Enter Initial Investment and Exit Value." : undefined}
+                  highlight={isFiniteNum(r.moic)}
+                />
+                <ResultRow
+                  label="IRR (Annualized)"
+                  value={isFiniteNum(r.irr) ? fmtPct(r.irr * 100) : "—"}
+                  note={!isFiniteNum(r.irr) ? "Enter all four inputs to calculate IRR." : undefined}
+                  redValue={isFiniteNum(r.irr) && r.irr < 0}
+                />
+                <ResultRow
+                  label="Holding Period"
+                  value={
+                    isFiniteNum(r.holdingYears) ? `${r.holdingYears.toFixed(1)} years` : "—"
+                  }
+                  note={
+                    !isFiniteNum(r.holdingYears)
+                      ? "Enter Investment Date and Exit Date."
+                      : undefined
+                  }
+                />
+                <ResultRow
+                  label="Cash-on-Cash Return"
+                  value={fmtPct(r.cashOnCash)}
+                  note={
+                    !isFiniteNum(r.cashOnCash)
+                      ? "Enter Initial Investment and Exit Value."
+                      : undefined
+                  }
+                  redValue={isFiniteNum(r.cashOnCash) && r.cashOnCash < 0}
+                />
+                <ResultRow
+                  label="Total Profit"
+                  value={fmtCurrency(r.totalProfit, currency)}
+                  note={
+                    !isFiniteNum(r.totalProfit)
+                      ? "Enter Initial Investment and Exit Value."
+                      : undefined
+                  }
+                  redValue={isFiniteNum(r.totalProfit) && r.totalProfit < 0}
+                />
+              </div>
+
+              {/* Line chart: value over time */}
+              {r.chartData && (
+                <div className="bg-slate-800/30 rounded-xl p-4 border border-slate-700/30">
+                  <p className="text-xs font-medium text-slate-500 uppercase tracking-wider mb-3">
+                    Value Growth Over Time
+                  </p>
+                  <div className="h-44">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart
+                        data={r.chartData}
+                        margin={{ top: 4, right: 8, left: 0, bottom: 0 }}
+                      >
+                        <XAxis
+                          dataKey="date"
+                          tick={{ fill: "#64748b", fontSize: 9 }}
+                          axisLine={false}
+                          tickLine={false}
+                          interval="preserveStartEnd"
+                        />
+                        <YAxis
+                          tickFormatter={(v) => {
+                            const abs = Math.abs(v);
+                            if (abs >= 1e6) return `${currSymbol}${(v / 1e6).toFixed(1)}M`;
+                            if (abs >= 1e3) return `${currSymbol}${(v / 1e3).toFixed(0)}k`;
+                            return `${currSymbol}${v}`;
+                          }}
+                          tick={{ fill: "#64748b", fontSize: 9 }}
+                          axisLine={false}
+                          tickLine={false}
+                          width={52}
+                        />
+                        <Tooltip
+                          formatter={(val) => [fmtCurrency(val, currency), "Value"]}
+                          contentStyle={{
+                            background: "#1e293b",
+                            border: "1px solid #334155",
+                            borderRadius: "8px",
+                            fontSize: "11px",
+                            color: "#cbd5e1",
+                          }}
+                        />
+                        <Line
+                          type="linear"
+                          dataKey="value"
+                          stroke="#0ea5e9"
+                          strokeWidth={2.5}
+                          dot={false}
+                          activeDot={{ r: 4, fill: "#0ea5e9" }}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── XIRR MODE ── */}
+        {inputs.mode === "xirr" && (
+          <div className="grid grid-cols-1 xl:grid-cols-5 gap-8">
+            {/* Cash flow table — 3 cols wide */}
+            <div className="xl:col-span-3">
+              <div className="flex items-center justify-between mb-3">
+                <SectionHeader>Cash Flows</SectionHeader>
+                <span className="text-xs text-slate-600 pb-3">
+                  {inputs.cashFlows.length}/50
+                </span>
+              </div>
+
+              {/* Column labels */}
+              <div className="grid gap-1 mb-1.5 px-0.5" style={{ gridTemplateColumns: "120px 1fr 130px 28px 28px" }}>
+                <span className="text-xs text-slate-500 font-medium">Date</span>
+                <span className="text-xs text-slate-500 font-medium">Label (optional)</span>
+                <span className="text-xs text-slate-500 font-medium">Amount</span>
+                <span />
+                <span />
+              </div>
+
+              <div className="space-y-1.5 max-h-96 overflow-y-auto pr-0.5">
+                {inputs.cashFlows.map((cf, idx) => {
+                  const proc = xr?.processedRows?.find((p) => p.id === cf.id);
+                  const missingDate = proc ? !proc.hasDate : false;
+                  const missingAmt = proc ? !proc.hasAmount : false;
+                  const excluded = proc?.excluded;
+                  return (
+                    <div
+                      key={cf.id}
+                      className={`grid gap-1 items-center rounded-lg px-1 py-0.5 ${
+                        excluded
+                          ? "bg-orange-950/20 border border-orange-800/20"
+                          : ""
+                      }`}
+                      style={{ gridTemplateColumns: "120px 1fr 130px 28px 28px" }}
+                    >
+                      <input
+                        type="date"
+                        value={cf.date}
+                        onChange={(e) => updateCashFlow(cf.id, "date", e.target.value)}
+                        className={`w-full bg-slate-800/80 border rounded-lg px-1.5 py-1.5 text-white text-xs focus:outline-none focus:border-cyan-500 transition-colors ${
+                          missingDate ? "border-orange-600/50" : "border-slate-600/70"
+                        }`}
+                      />
+                      <input
+                        type="text"
+                        value={cf.label}
+                        onChange={(e) => updateCashFlow(cf.id, "label", e.target.value)}
+                        placeholder="Label"
+                        className="w-full bg-slate-800/80 border border-slate-600/70 rounded-lg px-2 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors"
+                      />
+                      <div className="relative">
+                        {currSymbol && (
+                          <span className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400 text-xs pointer-events-none">
+                            {currSymbol}
+                          </span>
+                        )}
+                        <input
+                          type="number"
+                          value={cf.amount}
+                          onChange={(e) => updateCashFlow(cf.id, "amount", e.target.value)}
+                          placeholder="−250000"
+                          className={`w-full bg-slate-800/80 border rounded-lg py-1.5 pr-1 text-white text-xs placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition-colors appearance-none ${
+                            currSymbol ? "pl-5" : "px-2"
+                          } ${missingAmt ? "border-orange-600/50" : "border-slate-600/70"}`}
+                        />
+                      </div>
+                      {/* Up / down */}
+                      <div className="flex flex-col gap-0.5 items-center">
+                        <button
+                          onClick={() => moveCashFlow(cf.id, -1)}
+                          disabled={idx === 0}
+                          className="text-slate-600 hover:text-slate-300 disabled:opacity-20 text-xs leading-none"
+                          title="Move up"
+                        >
+                          ▲
+                        </button>
+                        <button
+                          onClick={() => moveCashFlow(cf.id, 1)}
+                          disabled={idx === inputs.cashFlows.length - 1}
+                          className="text-slate-600 hover:text-slate-300 disabled:opacity-20 text-xs leading-none"
+                          title="Move down"
+                        >
+                          ▼
+                        </button>
+                      </div>
+                      <button
+                        onClick={() => removeCashFlow(cf.id)}
+                        disabled={inputs.cashFlows.length <= 1}
+                        className="text-slate-600 hover:text-red-400 transition-colors text-lg leading-none disabled:opacity-20 text-center"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {inputs.cashFlows.length < 50 && (
+                <button
+                  onClick={addCashFlow}
+                  className="mt-3 text-xs text-cyan-400 hover:text-cyan-300 border border-cyan-600/30 hover:border-cyan-500/50 px-3 py-1.5 rounded-lg transition-colors w-full"
+                >
+                  + Add Cash Flow
+                </button>
+              )}
+
+              {xr?.processedRows?.some((p) => p.excluded) && (
+                <p className="text-xs text-orange-400/70 mt-2 italic">
+                  Rows with a missing date or amount are excluded from XIRR calculation.
+                </p>
+              )}
+            </div>
+
+            {/* Results — 2 cols wide */}
+            <div className="xl:col-span-2">
+              <SectionHeader>Results</SectionHeader>
+
+              {(xr?.validationError || xr?.xirrError) && (
+                <InfoBanner variant="yellow">
+                  {xr.validationError || xr.xirrError}
+                </InfoBanner>
+              )}
+
+              <div className="bg-slate-800/40 rounded-xl p-4 border border-slate-700/30 mb-4">
+                <ResultRow
+                  label="XIRR (Annualized)"
+                  value={isFiniteNum(xr?.xirrRate) ? fmtPct(xr.xirrRate * 100) : "—"}
+                  highlight={isFiniteNum(xr?.xirrRate)}
+                  redValue={isFiniteNum(xr?.xirrRate) && xr.xirrRate < 0}
+                />
+                <ResultRow
+                  label="MOIC"
+                  value={isFiniteNum(xr?.moic) ? `${xr.moic.toFixed(2)}x` : "—"}
+                />
+                <ResultRow
+                  label="Total Capital Invested"
+                  value={fmtCurrency(xr?.totalNegative, currency)}
+                  note={
+                    !isFiniteNum(xr?.totalNegative) ? "No negative cash flows." : undefined
+                  }
+                />
+                <ResultRow
+                  label="Total Distributions"
+                  value={fmtCurrency(xr?.totalPositive, currency)}
+                  note={
+                    !isFiniteNum(xr?.totalPositive) ? "No positive cash flows." : undefined
+                  }
+                />
+                <ResultRow
+                  label="Net Profit"
+                  value={fmtCurrency(xr?.netCF, currency)}
+                  redValue={isFiniteNum(xr?.netCF) && xr.netCF < 0}
+                />
+                <ResultRow
+                  label="Holding Period"
+                  value={
+                    isFiniteNum(xr?.holdingYears)
+                      ? `${xr.holdingYears.toFixed(1)} years`
+                      : "—"
+                  }
+                />
+              </div>
+
+              {/* ComposedChart: bars (cash flows) + line (cumulative) */}
+              {xr?.chartData && xr.chartData.length > 0 && (
+                <div className="bg-slate-800/30 rounded-xl p-4 border border-slate-700/30">
+                  <p className="text-xs font-medium text-slate-500 uppercase tracking-wider mb-1">
+                    Cash Flows &amp; Cumulative Position
+                  </p>
+                  <p className="text-xs text-slate-600 mb-3">
+                    Bars = individual CFs · Line = cumulative
+                  </p>
+                  <div className="h-48">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <ComposedChart
+                        data={xr.chartData}
+                        margin={{ top: 4, right: 8, left: 0, bottom: 0 }}
+                      >
+                        <XAxis
+                          dataKey="date"
+                          tick={{ fill: "#64748b", fontSize: 9 }}
+                          axisLine={false}
+                          tickLine={false}
+                          interval="preserveStartEnd"
+                        />
+                        <YAxis
+                          tickFormatter={(v) => {
+                            const abs = Math.abs(v);
+                            if (abs >= 1e6) return `${currSymbol}${(v / 1e6).toFixed(1)}M`;
+                            if (abs >= 1e3) return `${currSymbol}${(v / 1e3).toFixed(0)}k`;
+                            return `${currSymbol}${v.toFixed(0)}`;
+                          }}
+                          tick={{ fill: "#64748b", fontSize: 9 }}
+                          axisLine={false}
+                          tickLine={false}
+                          width={50}
+                        />
+                        <ReferenceLine y={0} stroke="#475569" strokeDasharray="3 3" />
+                        <Tooltip
+                          formatter={(val, name) => [
+                            fmtCurrency(val, currency),
+                            name === "amount" ? "Cash Flow" : "Cumulative",
+                          ]}
+                          contentStyle={{
+                            background: "#1e293b",
+                            border: "1px solid #334155",
+                            borderRadius: "8px",
+                            fontSize: "11px",
+                            color: "#cbd5e1",
+                          }}
+                        />
+                        <Bar dataKey="amount" name="amount" maxBarSize={40}>
+                          {xr.chartData.map((entry, i) => (
+                            <Cell
+                              key={i}
+                              fill={entry.isPositive ? "#22c55e" : "#ef4444"}
+                              fillOpacity={0.8}
+                            />
+                          ))}
+                        </Bar>
+                        <Line
+                          type="monotone"
+                          dataKey="cumulative"
+                          stroke="#0ea5e9"
+                          strokeWidth={2}
+                          dot={{ r: 3, fill: "#0ea5e9", strokeWidth: 0 }}
+                          activeDot={{ r: 5 }}
+                        />
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="flex gap-4 mt-2">
+                    {[
+                      { color: "#22c55e", label: "Inflow" },
+                      { color: "#ef4444", label: "Outflow" },
+                      { color: "#0ea5e9", label: "Cumulative" },
+                    ].map((l) => (
+                      <div key={l.label} className="flex items-center gap-1.5">
+                        <div className="w-2.5 h-2.5 rounded-sm" style={{ background: l.color }} />
+                        <span className="text-xs text-slate-400">{l.label}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </CalcCard>
+    </>
+  );
+}
+
+// ─── Calculator 5 — VC Portfolio Return Simulator ────────────────────────────
+
+const TIER_COLORS_VC = ["#ef4444", "#f59e0b", "#0ea5e9", "#22c55e", "#8b5cf6"];
+
+const VC_DEFAULTS = {
+  fundSize: "",
+  managementFeePct: "2",
+  feePeriod: "10",
+  carryPct: "20",
+  hurdleRate: "8",
+  numInvestments: "20",
+  avgCheckSize: "",
+  reserveRatio: "40",
+  tiers: [
+    { id: 1, label: "Total Loss",          multiple: 0,  pct: "30" },
+    { id: 2, label: "Returned Capital",    multiple: 1,  pct: "25" },
+    { id: 3, label: "Moderate Return (3x)", multiple: 3, pct: "25" },
+    { id: 4, label: "Strong Return (10x)", multiple: 10, pct: "15" },
+    { id: 5, label: "Home Run (30x)",      multiple: 30, pct: "5"  },
+  ],
+};
+
+function VCSimulator({ currency }) {
+  const [inputs, setInputs] = useState(VC_DEFAULTS);
+  const [copyFn, CopyModalNode] = useCopyToClipboard();
+
+  const setField = useCallback(
+    (field) => (val) => setInputs((prev) => ({ ...prev, [field]: val })),
+    []
+  );
+
+  const updateTier = useCallback((id, val) => {
+    setInputs((prev) => ({
+      ...prev,
+      tiers: prev.tiers.map((t) => (t.id === id ? { ...t, pct: val } : t)),
+    }));
+  }, []);
+
+  const results = useMemo(() => {
+    try {
+      const fundSize = parseVal(inputs.fundSize);
+      const mgmtFeePct = parseVal(inputs.managementFeePct);
+      const feePeriod = parseVal(inputs.feePeriod);
+      const carryPct = parseVal(inputs.carryPct);
+      const hurdleRateRaw = inputs.hurdleRate === "" ? 0 : parseVal(inputs.hurdleRate);
+      const hurdleRate = isFiniteNum(hurdleRateRaw) ? hurdleRateRaw : 0;
+      const numInv = parseVal(inputs.numInvestments);
+      const avgCheck = parseVal(inputs.avgCheckSize);
+      const reserveRatio = parseVal(inputs.reserveRatio);
+
+      const tierPcts = inputs.tiers.map((t) => ({
+        ...t,
+        pctNum: parseVal(t.pct),
+      }));
+      const tierSum = tierPcts.reduce(
+        (s, t) => s + (isFiniteNum(t.pctNum) ? t.pctNum : 0),
+        0
+      );
+      const tierSumValid = Math.abs(tierSum - 100) < 0.01;
+
+      // Management fees
+      const totalMgmtFees =
+        isFiniteNum(fundSize) && isFiniteNum(mgmtFeePct) && isFiniteNum(feePeriod)
+          ? fundSize * (mgmtFeePct / 100) * feePeriod
+          : null;
+
+      const investableCapital = isFiniteNum(fundSize)
+        ? isFiniteNum(totalMgmtFees)
+          ? fundSize - totalMgmtFees
+          : fundSize
+        : null;
+
+      const feesExceedFund =
+        isFiniteNum(investableCapital) && investableCapital <= 0;
+
+      if (feesExceedFund) {
+        return {
+          tierSum,
+          tierSumValid,
+          feesExceedFund: true,
+          fundSize,
+          totalMgmtFees,
+          investableCapital,
+        };
+      }
+
+      // Per-tier calculations
+      const tierReturns = tierPcts.map((t) => {
+        const capitalDeployed =
+          isFiniteNum(investableCapital) && isFiniteNum(t.pctNum)
+            ? investableCapital * (t.pctNum / 100)
+            : null;
+        const grossReturn = isFiniteNum(capitalDeployed)
+          ? capitalDeployed * t.multiple
+          : null;
+        return { ...t, capitalDeployed, grossReturn };
+      });
+
+      const totalGrossReturn = tierReturns.every((t) => isFiniteNum(t.grossReturn))
+        ? tierReturns.reduce((s, t) => s + t.grossReturn, 0)
+        : null;
+
+      const grossMOIC =
+        isFiniteNum(totalGrossReturn) &&
+        isFiniteNum(investableCapital) &&
+        investableCapital > 0
+          ? totalGrossReturn / investableCapital
+          : null;
+
+      const totalGrossProfit =
+        isFiniteNum(totalGrossReturn) && isFiniteNum(investableCapital)
+          ? totalGrossReturn - investableCapital
+          : null;
+
+      // Hurdle amount (compound)
+      const hurdleAmount =
+        isFiniteNum(fundSize) && isFiniteNum(feePeriod)
+          ? hurdleRate > 0
+            ? fundSize * Math.pow(1 + hurdleRate / 100, feePeriod)
+            : fundSize
+          : null;
+
+      // Carry
+      const carryBase =
+        isFiniteNum(totalGrossReturn) && isFiniteNum(hurdleAmount)
+          ? Math.max(0, totalGrossReturn - hurdleAmount)
+          : null;
+
+      const gpCarry =
+        isFiniteNum(carryBase) && isFiniteNum(carryPct)
+          ? carryBase * (carryPct / 100)
+          : null;
+
+      const netLPProceeds =
+        isFiniteNum(totalGrossReturn) && isFiniteNum(gpCarry)
+          ? totalGrossReturn - gpCarry
+          : null;
+
+      const netLPMOIC =
+        isFiniteNum(netLPProceeds) && isFiniteNum(fundSize) && fundSize > 0
+          ? netLPProceeds / fundSize
+          : null;
+
+      // Net LP IRR — lump-sum approximation
+      const netLPIRR =
+        isFiniteNum(netLPMOIC) &&
+        netLPMOIC > 0 &&
+        isFiniteNum(feePeriod) &&
+        feePeriod > 0
+          ? Math.pow(netLPMOIC, 1 / feePeriod) - 1
+          : null;
+
+      const dpi = netLPMOIC;
+
+      // "Return the Fund" multiple needed from Tier 5 home-run companies
+      const tier5 = tierPcts.find((t) => t.id === 5);
+      const returnFundThreshold =
+        isFiniteNum(fundSize) &&
+        isFiniteNum(investableCapital) &&
+        isFiniteNum(tier5?.pctNum) &&
+        tier5.pctNum > 0
+          ? fundSize / (investableCapital * (tier5.pctNum / 100))
+          : null;
+
+      // Deployment check
+      let deploymentNote = null;
+      if (
+        isFiniteNum(numInv) &&
+        isFiniteNum(avgCheck) &&
+        isFiniteNum(investableCapital) &&
+        isFiniteNum(reserveRatio)
+      ) {
+        const totalInitial = numInv * avgCheck;
+        const availableForInitial = investableCapital * (1 - reserveRatio / 100);
+        if (Math.abs(totalInitial - availableForInitial) > 1) {
+          deploymentNote = { totalInitial, availableForInitial };
+        }
+      }
+
+      // Chart: gross returns by tier
+      const tierChartData = tierReturns.map((t) => ({
+        name: t.label,
+        capitalDeployed: isFiniteNum(t.capitalDeployed) ? t.capitalDeployed : 0,
+        grossReturn: isFiniteNum(t.grossReturn) ? t.grossReturn : 0,
+        multiple: t.multiple,
+      }));
+
+      // Donut chart data
+      const lpReturnOfCap =
+        isFiniteNum(fundSize) && isFiniteNum(netLPProceeds)
+          ? Math.min(fundSize, Math.max(0, netLPProceeds))
+          : null;
+      const lpProfit =
+        isFiniteNum(netLPProceeds) && isFiniteNum(fundSize)
+          ? Math.max(0, netLPProceeds - fundSize)
+          : null;
+
+      const donutData = [
+        isFiniteNum(lpReturnOfCap) && lpReturnOfCap > 0
+          ? { name: "LP Return of Capital", value: Math.round(lpReturnOfCap), color: "#3b82f6" }
+          : null,
+        isFiniteNum(lpProfit) && lpProfit > 0
+          ? { name: "LP Profit", value: Math.round(lpProfit), color: "#22c55e" }
+          : null,
+        isFiniteNum(gpCarry) && gpCarry > 0
+          ? { name: "GP Carry", value: Math.round(gpCarry), color: "#f59e0b" }
+          : null,
+      ].filter(Boolean);
+
+      // Power law: Tier 5 share of total returns
+      const tier5Return = tierReturns.find((t) => t.id === 5);
+      const powerLawPct =
+        isFiniteNum(tier5Return?.grossReturn) &&
+        isFiniteNum(totalGrossReturn) &&
+        totalGrossReturn > 0
+          ? (tier5Return.grossReturn / totalGrossReturn) * 100
+          : null;
+
+      return {
+        fundSize,
+        investableCapital,
+        totalMgmtFees,
+        totalGrossReturn,
+        grossMOIC,
+        totalGrossProfit,
+        hurdleAmount,
+        gpCarry,
+        netLPProceeds,
+        netLPMOIC,
+        netLPIRR,
+        dpi,
+        returnFundThreshold,
+        tierReturns,
+        tierChartData,
+        donutData,
+        tierSum,
+        tierSumValid,
+        feesExceedFund: false,
+        deploymentNote,
+        powerLawPct,
+        tier5Pct: tier5?.pctNum,
+      };
+    } catch {
+      return { error: true };
+    }
+  }, [inputs]);
+
+  const handleReset = useCallback(() => setInputs(VC_DEFAULTS), []);
+
+  const handleCopy = useCallback(() => {
+    const r = results;
+    const text = [
+      "VC Portfolio Return Simulator",
+      "==============================",
+      `Fund Size:             ${fmtCurrency(r.fundSize, currency)}`,
+      `Total Mgmt Fees:       ${fmtCurrency(r.totalMgmtFees, currency)}`,
+      `Investable Capital:    ${fmtCurrency(r.investableCapital, currency)}`,
+      `Total Gross Return:    ${fmtCurrency(r.totalGrossReturn, currency)}`,
+      `Gross MOIC:            ${isFiniteNum(r.grossMOIC) ? r.grossMOIC.toFixed(2) + "x" : "—"}`,
+      `GP Carry:              ${fmtCurrency(r.gpCarry, currency)}`,
+      `Net LP Proceeds:       ${fmtCurrency(r.netLPProceeds, currency)}`,
+      `Net LP MOIC:           ${isFiniteNum(r.netLPMOIC) ? r.netLPMOIC.toFixed(2) + "x" : "—"}`,
+      `Est. Net LP IRR:       ${isFiniteNum(r.netLPIRR) ? fmtPct(r.netLPIRR * 100) : "—"}`,
+      `DPI:                   ${isFiniteNum(r.dpi) ? r.dpi.toFixed(2) + "x" : "—"}`,
+      `Return-Fund Threshold: ${isFiniteNum(r.returnFundThreshold) ? r.returnFundThreshold.toFixed(1) + "x needed from Tier 5" : "—"}`,
+    ].join("\n");
+    copyFn(text);
+  }, [results, currency, copyFn]);
+
+  const r = results;
+  const currSymbol = CURRENCY_META[currency]?.symbol || "$";
+
+  return (
+    <>
+      {CopyModalNode}
+      <CalcCard
+        title="VC Portfolio Return Simulator"
+        description="Model your fund's expected return distribution across a portfolio of investments. Understand the power law and what it takes to return your fund."
+        onReset={handleReset}
+        onCopy={handleCopy}
+      >
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+          {/* ── Inputs ── */}
+          <div>
+            <SectionHeader>Fund Parameters</SectionHeader>
+            <div className="grid grid-cols-2 gap-x-3">
+              <InputField
+                label="Fund Size"
+                value={inputs.fundSize}
+                onChange={setField("fundSize")}
+                placeholder="e.g. 100000000"
+                prefix={currSymbol}
+              />
+              <InputField
+                label="Management Fee %"
+                value={inputs.managementFeePct}
+                onChange={setField("managementFeePct")}
+                placeholder="2"
+                suffix="%"
+              />
+              <InputField
+                label="Fee Period"
+                value={inputs.feePeriod}
+                onChange={setField("feePeriod")}
+                placeholder="10"
+                suffix="yrs"
+              />
+              <InputField
+                label="Carry %"
+                value={inputs.carryPct}
+                onChange={setField("carryPct")}
+                placeholder="20"
+                suffix="%"
+              />
+              <InputField
+                label="Hurdle Rate %"
+                value={inputs.hurdleRate}
+                onChange={setField("hurdleRate")}
+                placeholder="8 (blank = 0%)"
+                suffix="%"
+              />
+              <InputField
+                label="Reserve Ratio %"
+                value={inputs.reserveRatio}
+                onChange={setField("reserveRatio")}
+                placeholder="40"
+                suffix="%"
+              />
+              <InputField
+                label="# of Investments"
+                value={inputs.numInvestments}
+                onChange={setField("numInvestments")}
+                placeholder="20"
+              />
+              <InputField
+                label="Avg. Check Size"
+                value={inputs.avgCheckSize}
+                onChange={setField("avgCheckSize")}
+                placeholder="e.g. 2500000"
+                prefix={currSymbol}
+              />
+            </div>
+
+            {r.deploymentNote && (
+              <InfoBanner variant="blue">
+                Initial checks would deploy{" "}
+                {fmtCurrency(r.deploymentNote.totalInitial, currency)} vs.{" "}
+                {fmtCurrency(r.deploymentNote.availableForInitial, currency)} available
+                for initial investments (after reserves).
+              </InfoBanner>
+            )}
+
+            {/* Return tier table */}
+            <div className="mt-4">
+              <div className="flex items-center justify-between mb-2">
+                <SectionHeader>Return Tiers</SectionHeader>
+                <span
+                  className={`text-xs pb-3 font-semibold tabular-nums ${
+                    r.tierSumValid ? "text-emerald-400" : "text-yellow-400"
+                  }`}
+                >
+                  Sum: {isFiniteNum(r.tierSum) ? r.tierSum.toFixed(1) : "0"}%
+                </span>
+              </div>
+
+              {!r.tierSumValid && (
+                <InfoBanner variant="yellow">
+                  Tier percentages must sum to 100% — currently {r.tierSum?.toFixed(1) ?? "0"}%.
+                  Calculations will proceed using these weights but results may be inconsistent.
+                </InfoBanner>
+              )}
+
+              <div className="space-y-1.5">
+                {inputs.tiers.map((tier, idx) => (
+                  <div key={tier.id} className="flex items-center gap-2">
+                    <div
+                      className="w-2.5 h-2.5 rounded-sm shrink-0"
+                      style={{ background: TIER_COLORS_VC[idx] }}
+                    />
+                    <span className="text-xs text-slate-300 flex-1 min-w-0 truncate">
+                      {tier.label}
+                    </span>
+                    <span className="text-xs text-slate-500 w-8 text-right shrink-0 tabular-nums">
+                      {tier.multiple}x
+                    </span>
+                    <div className="relative w-20 shrink-0">
+                      <input
+                        type="number"
+                        value={tier.pct}
+                        onChange={(e) => updateTier(tier.id, e.target.value)}
+                        className="w-full bg-slate-800/80 border border-slate-600/70 rounded-lg px-2 py-1.5 text-white text-xs text-right pr-6 focus:outline-none focus:border-cyan-500 transition-colors appearance-none"
+                      />
+                      <span className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 text-xs pointer-events-none">
+                        %
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* ── Results ── */}
+          <div>
+            <SectionHeader>Fund Returns</SectionHeader>
+
+            {r.feesExceedFund && (
+              <InfoBanner variant="yellow">
+                Management fees ({fmtCurrency(r.totalMgmtFees, currency)}) exceed fund size (
+                {fmtCurrency(r.fundSize, currency)}). Check your inputs.
+              </InfoBanner>
+            )}
+
+            {!r.feesExceedFund && (
+              <div className="bg-slate-800/40 rounded-xl p-4 border border-slate-700/30">
+                <ResultRow
+                  label="Fund Size"
+                  value={fmtCurrency(r.fundSize, currency)}
+                  note={!isFiniteNum(r.fundSize) ? "Enter Fund Size above." : undefined}
+                />
+                <ResultRow
+                  label="Total Management Fees"
+                  value={fmtCurrency(r.totalMgmtFees, currency)}
+                  note={
+                    !isFiniteNum(r.totalMgmtFees)
+                      ? "Enter Fund Size, Fee %, and Fee Period."
+                      : undefined
+                  }
+                />
+                <ResultRow
+                  label="Investable Capital"
+                  value={fmtCurrency(r.investableCapital, currency)}
+                  note={
+                    !isFiniteNum(r.investableCapital) ? "Enter Fund Size to calculate." : undefined
+                  }
+                  highlight={isFiniteNum(r.investableCapital)}
+                />
+                <ResultRow
+                  label="Total Gross Return"
+                  value={fmtCurrency(r.totalGrossReturn, currency)}
+                  note={
+                    !isFiniteNum(r.totalGrossReturn)
+                      ? "Enter Fund Size and tier percentages."
+                      : undefined
+                  }
+                />
+                <ResultRow
+                  label="Gross MOIC"
+                  value={isFiniteNum(r.grossMOIC) ? `${r.grossMOIC.toFixed(2)}x` : "—"}
+                />
+                <ResultRow
+                  label="GP Carry"
+                  value={fmtCurrency(r.gpCarry, currency)}
+                  note={
+                    !isFiniteNum(r.gpCarry)
+                      ? "Enter Fund Size, Carry %, and Hurdle Rate."
+                      : undefined
+                  }
+                />
+                <ResultRow
+                  label="Net LP Proceeds"
+                  value={fmtCurrency(r.netLPProceeds, currency)}
+                  highlight={isFiniteNum(r.netLPProceeds)}
+                />
+                <ResultRow
+                  label="Net LP MOIC"
+                  value={isFiniteNum(r.netLPMOIC) ? `${r.netLPMOIC.toFixed(2)}x` : "—"}
+                  redValue={isFiniteNum(r.netLPMOIC) && r.netLPMOIC < 1}
+                />
+                <ResultRow
+                  label="Est. Net LP IRR"
+                  value={isFiniteNum(r.netLPIRR) ? fmtPct(r.netLPIRR * 100) : "—"}
+                  redValue={isFiniteNum(r.netLPIRR) && r.netLPIRR < 0}
+                />
+                <ResultRow label="DPI" value={isFiniteNum(r.dpi) ? `${r.dpi.toFixed(2)}x` : "—"} />
+                <ResultRow
+                  label="RVPI"
+                  value="—"
+                  note="Simulator models full exit — RVPI not applicable."
+                />
+                <ResultRow
+                  label={`"Return the Fund" Threshold (Tier 5)`}
+                  value={
+                    isFiniteNum(r.returnFundThreshold)
+                      ? `${r.returnFundThreshold.toFixed(1)}x`
+                      : "—"
+                  }
+                  note={
+                    !isFiniteNum(r.returnFundThreshold)
+                      ? "Requires Fund Size and Tier 5 % to calculate."
+                      : undefined
+                  }
+                />
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* ── Full-width charts ── */}
+        {!r.feesExceedFund && isFiniteNum(r.totalGrossReturn) && (
+          <div className="mt-8 grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {/* Tier returns bar chart (2/3 width) */}
+            <div className="lg:col-span-2 bg-slate-800/30 rounded-xl p-4 border border-slate-700/30">
+              <p className="text-xs font-medium text-slate-500 uppercase tracking-wider mb-1">
+                Gross Returns by Tier
+              </p>
+              <p className="text-xs text-slate-600 mb-3">
+                Capital deployed (dark) vs. gross return generated (color) per tier
+              </p>
+              <div className="h-52">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart
+                    data={r.tierChartData}
+                    margin={{ top: 4, right: 8, left: 0, bottom: 44 }}
+                  >
+                    <XAxis
+                      dataKey="name"
+                      tick={{ fill: "#64748b", fontSize: 9 }}
+                      axisLine={false}
+                      tickLine={false}
+                      angle={-28}
+                      textAnchor="end"
+                      interval={0}
+                    />
+                    <YAxis
+                      tickFormatter={(v) => {
+                        if (Math.abs(v) >= 1e6)
+                          return `${currSymbol}${(v / 1e6).toFixed(0)}M`;
+                        if (Math.abs(v) >= 1e3)
+                          return `${currSymbol}${(v / 1e3).toFixed(0)}k`;
+                        return `${currSymbol}${v}`;
+                      }}
+                      tick={{ fill: "#64748b", fontSize: 9 }}
+                      axisLine={false}
+                      tickLine={false}
+                      width={52}
+                    />
+                    <Tooltip
+                      formatter={(val, name) => [
+                        fmtCurrency(val, currency),
+                        name === "capitalDeployed" ? "Capital Deployed" : "Gross Return",
+                      ]}
+                      contentStyle={{
+                        background: "#1e293b",
+                        border: "1px solid #334155",
+                        borderRadius: "8px",
+                        fontSize: "11px",
+                        color: "#cbd5e1",
+                      }}
+                    />
+                    <Bar
+                      dataKey="capitalDeployed"
+                      fill="#1e3a5f"
+                      radius={[3, 3, 0, 0]}
+                      name="capitalDeployed"
+                    />
+                    <Bar dataKey="grossReturn" radius={[3, 3, 0, 0]} name="grossReturn">
+                      {(r.tierChartData || []).map((_, i) => (
+                        <Cell key={i} fill={TIER_COLORS_VC[i]} fillOpacity={0.85} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1">
+                {(r.tierChartData || []).map((t, i) => (
+                  <div key={t.name} className="flex items-center gap-1.5">
+                    <div
+                      className="w-2.5 h-2.5 rounded-sm"
+                      style={{ background: TIER_COLORS_VC[i] }}
+                    />
+                    <span className="text-xs text-slate-400">
+                      {t.name.split(" ")[0]} ({t.multiple}x)
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Right column: power law callout + donut */}
+            <div className="space-y-4">
+              {/* Power law stat card */}
+              {isFiniteNum(r.powerLawPct) && isFiniteNum(r.tier5Pct) && (
+                <div className="bg-gradient-to-br from-violet-900/30 to-cyan-900/20 border border-violet-500/20 rounded-xl p-5 text-center">
+                  <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">
+                    Power Law
+                  </p>
+                  <p className="text-4xl font-black text-white leading-none">
+                    {r.tier5Pct?.toFixed(0)}%
+                  </p>
+                  <p className="text-xs text-slate-400 mt-1">of your portfolio</p>
+                  <p className="text-xs text-slate-500 my-2 font-light">generates</p>
+                  <p className="text-4xl font-black text-cyan-400 leading-none">
+                    {r.powerLawPct.toFixed(0)}%
+                  </p>
+                  <p className="text-xs text-slate-400 mt-1">of total gross returns</p>
+                </div>
+              )}
+
+              {/* Return split donut */}
+              {r.donutData && r.donutData.length > 0 && (
+                <div className="bg-slate-800/30 rounded-xl p-4 border border-slate-700/30">
+                  <p className="text-xs font-medium text-slate-500 uppercase tracking-wider mb-1">
+                    Return Split
+                  </p>
+                  <div className="h-36">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart>
+                        <Pie
+                          data={r.donutData}
+                          cx="50%"
+                          cy="50%"
+                          innerRadius={36}
+                          outerRadius={58}
+                          paddingAngle={2}
+                          dataKey="value"
+                        >
+                          {r.donutData.map((entry, i) => (
+                            <Cell key={i} fill={entry.color} />
+                          ))}
+                        </Pie>
+                        <Tooltip
+                          formatter={(val) => [fmtCurrency(val, currency), ""]}
+                          contentStyle={{
+                            background: "#1e293b",
+                            border: "1px solid #334155",
+                            borderRadius: "8px",
+                            fontSize: "11px",
+                            color: "#cbd5e1",
+                          }}
+                        />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="space-y-1.5 mt-1">
+                    {r.donutData.map((d) => (
+                      <div key={d.name} className="flex items-center justify-between">
+                        <div className="flex items-center gap-1.5">
+                          <div
+                            className="w-2 h-2 rounded-sm shrink-0"
+                            style={{ background: d.color }}
+                          />
+                          <span className="text-xs text-slate-400">{d.name}</span>
+                        </div>
+                        <span className="text-xs text-slate-300 font-medium tabular-nums">
+                          {fmtCurrency(d.value, currency)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </CalcCard>
+    </>
+  );
+}
+
 // ─── Calculator Registry ──────────────────────────────────────────────────────
 
 const CALCULATORS = [
@@ -2271,6 +3699,16 @@ const CALCULATORS = [
     id: "cap-table",
     label: "Cap Table",
     Component: CapTableSimulator,
+  },
+  {
+    id: "irr-moic",
+    label: "IRR / MOIC",
+    Component: IRRCalculator,
+  },
+  {
+    id: "vc-simulator",
+    label: "VC Simulator",
+    Component: VCSimulator,
   },
 ];
 
