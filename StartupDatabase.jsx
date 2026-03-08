@@ -656,9 +656,9 @@ function downloadCSV(startups) {
   URL.revokeObjectURL(url);
 }
 
-// ─── Main Component ───────────────────────────────────────────────────────────
+// ─── Inner Component ──────────────────────────────────────────────────────────
 
-export default function StartupDatabase() {
+function StartupDatabaseInner() {
   const [startups, setStartups] = useState(() =>
     SEED_DATA.map((s) => ({ ...s }))
   );
@@ -953,6 +953,30 @@ export default function StartupDatabase() {
           onClose={() => setDetail(null)}
         />
       )}
+    </div>
+  );
+}
+
+// ─── Standalone Page ──────────────────────────────────────────────────────────
+
+export default function StartupDatabase() {
+  return (
+    <div className="min-h-screen bg-[#0f172a] text-white antialiased">
+      {/* Header */}
+      <header className="sticky top-0 z-40 bg-[#0c1525]/95 backdrop-blur-md border-b border-slate-800/80 shadow-xl shadow-black/20">
+        <div className="max-w-7xl mx-auto px-4">
+          <div className="flex items-center h-14 gap-3">
+            <span className="text-sm font-bold text-white tracking-tight">Startup Database</span>
+            <div className="w-px h-5 bg-slate-700" />
+            <span className="text-xs text-slate-400">Company research &amp; tracking</span>
+          </div>
+        </div>
+      </header>
+
+      {/* Main */}
+      <main className="max-w-7xl mx-auto px-4 py-8">
+        <StartupDatabaseInner />
+      </main>
     </div>
   );
 }
